@@ -1,0 +1,54 @@
+# QUANT KALSHI en Docker (alternativa al despliegue con systemd).
+#
+#   cp deploy/env.vps.example .env   # rellena credenciales
+#   docker compose up -d --build
+#   docker compose logs -f
+#
+# El bot guarda su estado (paper_trades.json, trade_memory.json, quant_ml_state.json,
+# strategy_governor.json) EN EL MISMO DIRECTORIO DEL CODIGO, asi que se monta el
+# checkout completo: el estado sobrevive a los reinicios del contenedor y un
+# `git pull` actualiza el codigo sin reconstruir la imagen.
+services:
+  quantkalshi:
+    build: .
+    image: quantkalshi:latest
+    container_name: quantkalshi
+    restart: unless-stopped
+    working_dir: /app
+    command: ["python", "main.py"]
+
+    # UID/GID del usuario dueno del checkout: asi los JSON de estado quedan a tu
+    # nombre y `git pull` no exige sudo.
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
+
+    env_file:
+      - .env
+
+    environment:
+      PYTHONUNBUFFERED: "1"
+      TZ: "${TZ:-UTC}"
+
+    volumes:
+      - ./:/app
+
+    # Solo accesible desde la propia VPS: entra por tunel SSH
+    #   ssh -N -L 8000:127.0.0.1:8000 usuario@vps   ->   http://localhost:8000/dashboard
+    ports:
+      - "127.0.0.1:${APP_PORT:-8000}:8000"
+
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=8)"
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

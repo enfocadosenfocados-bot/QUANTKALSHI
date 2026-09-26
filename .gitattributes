@@ -1,0 +1,12 @@
+# Los scripts de despliegue se ejecutan en la VPS (Linux): deben viajar con LF.
+# Si se commitean con CRLF, bash falla con "\r: command not found" y systemd se
+# queja de las lineas Exec*=.
+*.sh            text eol=lf
+*.service       text eol=lf
+Dockerfile      text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+deploy/env*     text eol=lf
+.env.example    text eol=lf
+.gitattributes  text eol=lf
+.gitignore      text eol=lf

@@ -1,0 +1,47 @@
+# Todo lo que no debe entrar en la imagen ni en el contexto de build.
+.git/
+.github/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Secretos y estado local
+.env
+.env.*
+!.env.example
+kalshi_credentials.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime
+logs/
+*.log
+*.pid
+paper_trades.json
+paper_trades_research.json
+trade_memory.json
+quant_ml_state.json
+strategy_governor.json
+fee_calibration.json
+state/
+data/
+
+# Copias locales
+backup_*/
+archivo_pre_realismo_*/
+*.bak
+*.orig
+
+# Despliegue / docs
+deploy/
+docker-compose.yml
+README.md
+.gitattributes
+.gitignore
+.dockerignore

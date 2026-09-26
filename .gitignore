@@ -1,0 +1,74 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Local config / secrets  (NUNCA versionar)
+.env
+.env.*
+!.env.example
+!deploy/env.vps.example
+clob_credentials.json
+kalshi_credentials.json
+*.pem
+*.key
+*.p8
+*.p12
+*.pfx
+
+# Runtime files
+*.log
+*.out.log
+*.err.log
+*.pid
+server-live.*
+server-fixed-*.log
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Build / distribution
+build/
+dist/
+*.egg-info/
+
+# Kalshi local credentials
+kalshi_credentials.json
+.env.local
+
+
+# Logs del supervisor 24/7
+logs/
+
+# Estado de runtime: el bot los recrea solo en el primer arranque.
+# Para arrancar la VPS con el historial de paper trading, copialos a mano
+# (README > "Migrar el estado de paper trading").
+paper_trades.json
+paper_trades_research.json
+trade_memory.json
+quant_ml_state.json
+strategy_governor.json
+fee_calibration.json
+state/
+
+# Copias de seguridad / archivados: contienen snapshots del codigo Y del .env
+# (con credenciales dentro). NUNCA deben entrar al repositorio.
+backup_*/
+backup-*/
+archivo_pre_realismo_*/
+archivo_*/
+

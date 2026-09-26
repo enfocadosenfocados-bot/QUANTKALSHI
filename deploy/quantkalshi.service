@@ -1,0 +1,43 @@
+[Unit]
+Description=QUANT KALSHI - bot de trading 24/7 (Kalshi Trade API v2)
+Documentation=file://__APP_DIR__/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__RUN_USER__
+Group=__RUN_GROUP__
+WorkingDirectory=__APP_DIR__
+
+# El .env se lee dos veces: systemd lo inyecta como entorno y config.py lo parsea
+# el mismo. El prefijo '-' hace que el arranque no falle si todavia no existe.
+EnvironmentFile=-__APP_DIR__/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+ExecStart=__APP_DIR__/venv/bin/python main.py
+
+# 24/7 sin supervisor externo: systemd relanza el proceso si muere o si el
+# servidor sale por un fallo no capturado.
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+KillMode=mixed
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=quantkalshi
+
+# Endurecimiento. La app solo necesita escribir en su propio directorio (estado en
+# JSON, logs) y leer el PEM de credenciales (fuera del repo, ~/.kalshi).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=__APP_DIR__
+
+[Install]
+WantedBy=multi-user.target
