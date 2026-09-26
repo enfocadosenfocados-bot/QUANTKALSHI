@@ -8,8 +8,11 @@ Pruebas cuantitativas y de verificación para:
 - Integración en Paper Tracker y Kelly Sizing
 """
 
-import time
 import math
+import tempfile
+import time
+from pathlib import Path
+
 from lead_lag_engine import lead_lag_engine, LeadLagEngine
 from ai_learning_engine import ai_learning_engine, AILearningEngine, PAVAIsotonicCalibrator
 from news_oracle_agent import news_oracle_agent, NewsOracleAgent
@@ -18,6 +21,13 @@ from paper_tracker import calculate_kelly_size, paper_tracker
 
 def test_lead_lag_engine():
     print("[TEST 1/4] Probando Motor Lead-Lag...")
+    # El disparo automático solo registra si hay cupo, y el tracker compartido
+    # puede estar ocupado por posiciones heredadas: apuntar a un historial
+    # temporal mide el cableado del sniper (y del anclaje de riesgo) sin depender
+    # de la ocupación del momento ni tocar el track record real.
+    tmp_dir = tempfile.TemporaryDirectory()
+    paper_tracker.storage_path = Path(tmp_dir.name) / "paper_trades_leadlag.json"
+    paper_tracker.trades = {}
     engine = LeadLagEngine()
     now = time.time()
 
@@ -48,7 +58,23 @@ def test_lead_lag_engine():
     opp = opps[0]
     assert opp.edge_pct > 8.0, "El edge matemático debe superar el 8%"
     assert opp.status == "EXECUTED_AUTO", f"La oportunidad debe ejecutarse de forma 100% automática, obtenido {opp.status}"
+    # AUTO-DISPARADO tiene que corresponder a un trade registrado: antes el motor
+    # ponía el estado a AUTO aunque el paper tracker hubiera rechazado la señal
+    # (mercado dict sin quotes ni liquidez), así que el sniper salía con 0 trades
+    # en el track record mientras el dashboard anunciaba ejecución.
+    recorded = [t for t in paper_tracker.trades.values() if t.get("strategy_code") == "LL_SNIPER"]
+    assert recorded, "El estado AUTO exige un trade registrado en paper trading"
+    snipe = recorded[0]
+    assert snipe["entry_price"] == opp.clob_price, (
+        f"La entrada registrada debe ser el fill real ({opp.clob_price}), no "
+        f"{snipe['entry_price']}"
+    )
+    assert snipe["stop_loss"] < snipe["entry_price"] < snipe["target_price"], (
+        "Stop y objetivo deben colgar del fill, no quedar del lado equivocado"
+    )
     print(f"  -> Disparo 100% Autónomo: Status = {opp.status}")
+    print(f"  -> Registrado en paper: {snipe['trade_id']} entrada {snipe['entry_price']} "
+          f"stop {snipe['stop_loss']} objetivo {snipe['target_price']}")
     print("  [OK] Motor Lead-Lag y Auto-Sniper validados exitosamente.\n")
 
 

@@ -14,6 +14,8 @@ from datetime import UTC, datetime
 from math import sqrt
 from typing import Any, Dict, List, Optional, Tuple
 
+from position_side import is_long_side
+
 try:
     from strategy_governor import governor as _governor
 except Exception:
@@ -83,9 +85,16 @@ def wilson_interval(wins: int, n: int, z: float = Z95) -> Tuple[float, float]:
 
 
 def breakeven_for_trade(t: Dict[str, Any]) -> float:
+    """Win rate que hace rentable la operación.
+
+    Un largo comprado a ``entry`` necesita ganar al menos ``entry`` de las veces
+    (paga 1 si acierta, cuesta ``entry``); un corto vendido a ``entry`` gana
+    ``1 - entry`` cuando acierta, así que le basta ``1 - entry``. El market making
+    (``side="BOTH"``) es un largo: calcularle ``1 - entry`` le regalaba edge y
+    p-valor en el criterio que decide la promoción a LIVE.
+    """
     entry = _f(t.get("entry_price"), 0.5)
-    side = str(t.get("side") or "BUY").upper()
-    if side == "BUY":
+    if is_long_side(t.get("side")):
         return min(0.99, max(0.01, entry))
     return min(0.99, max(0.01, 1.0 - entry))
 
@@ -190,7 +199,10 @@ def ml_effect(kelly):
 
 def build_strategy_ranking(paper_tracker, ai_learning_engine, quant_ml, mode: str = "realistic") -> Dict[str, Any]:
     """Construye el ranking completo cruzando paper trading + IA + Quant ML."""
-    trades = list(getattr(paper_tracker, "trades", {}).values()) or []
+    # Sólo el alcance vigente decide: los cierres anteriores al harness corregido
+    # los produjo un bug de medición, no la estrategia (ver paper_tracker).
+    _scoped = getattr(paper_tracker, "accounted_trades", None)
+    trades = list(_scoped() if callable(_scoped) else getattr(paper_tracker, "trades", {}).values()) or []
     if mode == "research":
         budget = getattr(paper_tracker, "budget_per_strategy", 1000.0)
     else:

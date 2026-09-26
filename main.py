@@ -88,6 +88,8 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(vpin_feed_task()),
         asyncio.create_task(vpin_backfill_task()),
         asyncio.create_task(lead_lag_sync_task()),
+        # Órdenes reales: cancela lo que quedó vivo y cuadra el registro local.
+        asyncio.create_task(live_reconcile_task()),
         asyncio.create_task(news_bridge_task()),
         asyncio.create_task(whale_tracking_task()),
         asyncio.create_task(strategy_calculation_task()),
@@ -579,6 +581,24 @@ async def lead_lag_sync_task():
                 registry.system_stats["lead_lag_real_contracts"] = len(contracts)
         except Exception as exc:
             print(f"[BG LeadLag] Error: {exc}")
+        await asyncio.sleep(120)
+
+
+async def live_reconcile_task():
+    """Cancela órdenes reales que quedaron vivas y cuadra el registro local.
+
+    Se ejecuta también en modo PAPER a propósito: tras un reinicio, las órdenes que
+    dejó vivas la sesión anterior siguen en el exchange y hay que cancelarlas, no
+    olvidarlas. Sin órdenes locales abiertas la tarea no hace ninguna llamada.
+    """
+    await asyncio.sleep(180)
+    while True:
+        try:
+            summary = await live_manager.reconcile_orders()
+            if summary.get("canceled") or summary.get("closed_remotely") or summary.get("errors"):
+                print(f"[BG Live] Reconciliacion: {summary}")
+        except Exception as exc:
+            print(f"[BG Live] Error en reconciliacion: {exc}")
         await asyncio.sleep(120)
 
 
@@ -1366,19 +1386,73 @@ async def get_lead_lag_opportunities():
 
 @app.post("/api/lead-lag/execute")
 async def execute_lead_lag_snipe(payload: Dict[str, Any]):
-    """Ejecutar un trade de arbitraje Lead-Lag manual o automático."""
+    """Ejecutar un snipe Lead-Lag: registro real en paper y, si toca, orden real.
+
+    Antes esta ruta respondía "Orden Lead-Lag enviada" sin enviar ni registrar nada: el
+    dashboard mentía y el operador creía tener una posición que no existía. Ahora
+    devuelve lo que de verdad ha pasado: registrado en paper, enviado, o bloqueado y
+    por qué.
+    """
     opp_id = payload.get("opportunity_id")
     opp = next((o for o in lead_lag_engine.active_opportunities if o.id == opp_id), None)
     if not opp:
         return {"success": False, "error": "Oportunidad no encontrada o expirada"}
 
-    # Disparar simulación de entrada o ejecución Kalshi según modo
-    opp.status = "EXECUTED"
-    return {
-        "success": True,
-        "message": f"Orden Lead-Lag enviada para {opp.symbol} {opp.outcome} a ${opp.clob_price}",
-        "opportunity": opp.__dict__ if hasattr(opp, "__dict__") else opp,
+    signal, market = lead_lag_engine.build_snipe_context(opp)
+    wants_live = bool(payload.get("live") or payload.get("confirm_live_order"))
+    if wants_live:
+        # El candado manual sigue siendo manual: el dashboard debe pedirlo explícitamente.
+        signal["confirm_live_order"] = bool(payload.get("confirm_live_order"))
+
+    trade = paper_tracker.evaluate_and_record_signal(signal, market)
+    result: Dict[str, Any] = {
+        "success": bool(trade),
+        "mode": live_manager.mode,
+        "paper_recorded": bool(trade),
+        "message": "Registrado en paper trading.",
     }
+    if not trade:
+        result["message"] = (
+            "El gestor de riesgo de paper rechazo la senal (duplicada, liquidez "
+            "insuficiente o exposicion en el limite); no se envia nada a live."
+        )
+        return result
+
+    opp.status = "EXECUTED"
+    size_usd = float(signal.get("position_size_usd") or 0.0)
+    result["size_usd"] = size_usd
+    result["opportunity"] = opp.__dict__ if hasattr(opp, "__dict__") else opp
+
+    if live_manager.is_live:
+        live_result = await live_manager.execute_order(signal, market, size_usd)
+        result["live"] = live_result
+        result["success"] = bool(live_result.get("executed"))
+        if live_result.get("executed"):
+            result["message"] = (
+                f"Orden real enviada: order_id={live_result.get('order_id')} (${size_usd:.2f})."
+            )
+        else:
+            result["message"] = (
+                f"Registrado en paper; la orden real NO se envio "
+                f"({live_result.get('blocked_by') or 'error'}): {live_result.get('error')}"
+            )
+    elif wants_live:
+        result["message"] = "Registrado en paper; para orden real el bot debe estar en modo LIVE."
+    return result
+
+
+# ========== ENDPOINTS DE ORDENES REALES ==========
+
+@app.get("/api/live/orders")
+async def get_live_orders():
+    """Registro de ordenes reales enviadas + estado de la ultima reconciliacion."""
+    return live_manager.live_orders_status()
+
+
+@app.post("/api/live/reconcile")
+async def post_live_reconcile():
+    """Cuadra el registro local con Kalshi y cancela las ordenes vivas caducadas."""
+    return await live_manager.reconcile_orders()
 
 
 # ========== ENDPOINTS AGENTE IA & AUTO-APRENDIZAJE ==========
@@ -1401,7 +1475,10 @@ async def get_ai_agent_reflections():
 @app.post("/api/ai-agent/optimize")
 async def trigger_ai_optimization():
     """Ejecutar ciclo forzado de auto-aprendizaje, regresión isotónica y re-calibración de pesos."""
-    closed_trades = [t for t in paper_tracker.trades.values() if t.get("status") in ("WON", "LOST")]
+    # Mismo alcance que el bucle automático: el registro anterior al harness corregido
+    # no entrena nada (ver paper_tracker.accounted_trades).
+    from paper_tracker import closed_trades_of_scope
+    closed_trades = closed_trades_of_scope(paper_tracker)
     result = ai_learning_engine.run_daily_calibration(closed_trades)
     return result
 
@@ -1552,6 +1629,10 @@ async def health():
         "kalshi_maintenance_window": KALSHI_STATE.get("maintenance_window"),
         "uptime_seconds": round(now_ts - START_TS, 1),
         "governor": governor.get_status(),
+        # Órdenes reales vivas y última reconciliación: es lo primero que hay que mirar
+        # cuando el PnL real no cuadra con lo que el bot cree que envió.
+        "open_live_orders": live_manager.open_live_order_count(),
+        "last_live_reconcile": getattr(live_manager, "last_reconcile", {}),
     }
 
 

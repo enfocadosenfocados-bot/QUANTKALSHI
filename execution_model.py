@@ -31,6 +31,7 @@ from config import (
     PAPER_MAKER_FILL_PROBABILITY,
 )
 from fee_calibration import effective_fee_config
+from position_side import is_long_side
 
 CENT = 0.01
 # Tamaño asumido cuando el libro llega vacío y solo hay quotes del market object.
@@ -292,7 +293,7 @@ def simulate_taker_fill(
     profundidad disponible (con margen de seguridad, porque no todo lo mostrado
     es ejecutable en nuestra dirección).
     """
-    is_buy = str(side).upper() == "BUY"
+    is_buy = is_long_side(side)
     wanted = float(contracts_requested)
     levels = asks if is_buy else bids
     total_depth = sum(size for _, size in levels)
@@ -394,7 +395,7 @@ def simulate_maker_fill(
     supuesto pendiente de medir, no un hecho: `fee_rate` permite fijarlo de forma
     explícita en tests y en la sonda de calibración.
     """
-    is_buy = str(side).upper() == "BUY"
+    is_buy = is_long_side(side)
     wanted = float(contracts_requested)
     levels = asks if is_buy else bids
     total_depth = sum(size for _, size in levels)

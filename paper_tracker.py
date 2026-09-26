@@ -26,6 +26,12 @@ try:
         PAPER_ALLOW_NON_FLASH,
         PAPER_INITIAL_BALANCE,
         PAPER_MIN_TRADES_FOR_EMPIRICAL_WR,
+        PAPER_ENTRY_DRIFT_PCT,
+        PAPER_ENTRY_DRIFT_MIN_ABS,
+        PAPER_RECORD_SCOPE,
+        PAPER_LEGACY_SCOPE,
+        PAPER_ZOMBIE_SCOPE,
+        PAPER_ZOMBIE_HOURS,
     )
 except ImportError:
     PAPER_MAX_EXPOSURE_USD = 1000.0
@@ -44,8 +50,20 @@ except ImportError:
     PAPER_ALLOW_NON_FLASH = True
     PAPER_INITIAL_BALANCE = 1000.0
     PAPER_MIN_TRADES_FOR_EMPIRICAL_WR = 20
+    PAPER_ENTRY_DRIFT_PCT = 0.15
+    PAPER_ENTRY_DRIFT_MIN_ABS = 0.02
+    PAPER_RECORD_SCOPE = "harness_v2"
+    PAPER_LEGACY_SCOPE = "legacy_pre_harness_fix"
+    PAPER_ZOMBIE_SCOPE = "harness_zombie"
+    PAPER_ZOMBIE_HOURS = 6.0
 
 from execution_model import book_levels, execution_model, normalize_levels
+
+# Convención única de lado (largos vs cortos). Ver position_side.py: BOTH (market
+# making) y BUY_BUNDLE son largos, y tratarlos como cortos invertía la referencia
+# de salida (ask en vez de bid), la condición de take profit y la etiqueta
+# WON/LOST: 39 cierres de MM quedaron etiquetados LOST con PnL positivo.
+from position_side import entry_order_side, exit_order_side, is_long_side
 
 
 def utc_now() -> datetime:
@@ -59,6 +77,34 @@ def to_float(val: Any, default: float = 0.0) -> float:
         return float(val)
     except (ValueError, TypeError):
         return default
+
+
+def entry_geometry_valid(entry_price: float, stop_loss: float, target_price: float, side: Any) -> bool:
+    """True si la geometría riesgo/beneficio es alcanzable desde la entrada real.
+
+    Un largo necesita stop por debajo y objetivo por encima; un corto, al revés.
+    Es la única invariante que separa una medición de un sesgo: cuando la señal
+    calcula stop/objetivo sobre su precio y el fill llega a otro, el tracker abría
+    la operación con el stop ya cruzado y la cerraba en el ciclo siguiente, con 0.0
+    minutos de vida (100/108 de S20, 32/32 de S21, 35/36 de S23).
+    """
+    if entry_price <= 0 or stop_loss <= 0 or target_price <= 0:
+        return False
+    if is_long_side(side):
+        return stop_loss < entry_price < target_price
+    return target_price < entry_price < stop_loss
+
+
+def closed_trades_of_scope(engine: Any) -> List[Dict[str, Any]]:
+    """Cierres del alcance vigente de un tracker: lo único que puede decidir algo.
+
+    Se usa desde ai_learning_engine y los endpoints, para que ni el aprendizaje ni
+    la promoción se entrenen con el registro anterior (sesgado por el bug de lado y
+    por los stops anclados al precio de la señal).
+    """
+    accessor = getattr(engine, "accounted_trades", None)
+    trades = accessor() if callable(accessor) else list(getattr(engine, "trades", {}).values())
+    return [t for t in trades if t.get("status") in ("WON", "LOST")]
 
 
 def calculate_kelly_size(
@@ -84,7 +130,9 @@ def calculate_kelly_size(
     p = max(0.01, min(0.99, confidence / 100.0))
     q = 1.0 - p
 
-    if side.upper() == "BUY":
+    # El payoff se lee siempre como posición larga sobre el token salvo en los
+    # lados genuinamente cortos (SELL/SELL_BUNDLE).
+    if is_long_side(side):
         reward = max(0.005, target_price - entry_price)
         risk = max(0.005, entry_price - stop_loss)
     else:
@@ -171,6 +219,21 @@ class PaperTradingEngine:
                     loaded = data.get("trades", {})
                     # Filtrar exclusivamente las que tengan confianza >= 75% (Ultra)
                     self.trades = {k: v for k, v in loaded.items() if to_float(v.get("confidence"), 0) >= 75.0}
+                    # Migración de alcance: lo escrito antes del harness corregido no
+                    # puede contar para las decisiones (lado mal etiquetado + stop
+                    # anclado al precio de la señal). Se conserva para auditoría, con
+                    # marca, fuera de win rate, Kelly, gobernador y promoción.
+                    migrated = 0
+                    for _trade in self.trades.values():
+                        if not _trade.get("record_scope"):
+                            _trade["record_scope"] = PAPER_LEGACY_SCOPE
+                            migrated += 1
+                    if migrated:
+                        print(
+                            f"[PaperTrading] {migrated} trades marcados como '{PAPER_LEGACY_SCOPE}' "
+                            f"en {self.storage_path.name}: siguen visibles para auditoria pero "
+                            "fuera de las estadisticas de decision."
+                        )
             except Exception as e:
                 # Si esto ocurre se empieza de cero y el track record desaparece,
                 # asi que merece un aviso explicito y no un mensaje de paso.
@@ -203,6 +266,45 @@ class PaperTradingEngine:
                     tmp_path.unlink()
             except Exception:
                 pass
+
+    @staticmethod
+    def scope_of(trade: Dict[str, Any]) -> str:
+        """Alcance de un trade. Sin marca se asume legado: nunca cuenta."""
+        return str(trade.get("record_scope") or PAPER_LEGACY_SCOPE)
+
+    def accounted_trades(self) -> List[Dict[str, Any]]:
+        """Trades que cuentan para agregados (win rate, PnL, Kelly, promoción).
+
+        Regla: entra el alcance vigente y entra cualquier posición abierta heredada
+        (sigue siendo inventario real: su PnL flotante es dinero vivo y su capital
+        está comprometido). Lo que no entra nunca es un cierre anterior al harness
+        corregido: esos resultados los produjo el propio bug, no la estrategia, y
+        mezclarlos hace que la muestra limpia arranque envenenada.
+        """
+        return [
+            t for t in self.trades.values()
+            if self.scope_of(t) == PAPER_RECORD_SCOPE or t.get("status") == "OPEN"
+        ]
+
+    def legacy_stats(self) -> Dict[str, Any]:
+        """Resumen de lo excluido, para que la exclusión sea visible y auditable."""
+        legacy = [t for t in self.trades.values() if self.scope_of(t) != PAPER_RECORD_SCOPE]
+        closed = [t for t in legacy if t.get("status") in ("WON", "LOST")]
+        wins = sum(1 for t in closed if t.get("status") == "WON")
+        return {
+            "scope": PAPER_RECORD_SCOPE,
+            "legacy_scope": PAPER_LEGACY_SCOPE,
+            "zombie_scope": PAPER_ZOMBIE_SCOPE,
+            "legacy_trades": len(legacy),
+            "legacy_closed": len(closed),
+            "legacy_open": len(legacy) - len(closed),
+            "legacy_win_rate_pct": round(wins / len(closed) * 100.0, 1) if closed else 0.0,
+            "legacy_pnl_usd": round(sum(to_float(t.get("realized_pnl_usd"), 0.0) for t in closed), 2),
+            "legacy_reason": (
+                "medidos con el harness anterior (lado mal etiquetado y stop anclado al "
+                "precio de la señal): se conservan para auditoría, no para decidir"
+            ),
+        }
 
     def evaluate_and_record_signal(self, signal: Dict[str, Any], market: Any) -> Optional[Dict[str, Any]]:
         """Evalúa si una señal califica como 'Top Sniper' y la registra en el track record con Kelly Sizing."""
@@ -239,14 +341,15 @@ class PaperTradingEngine:
             return None
 
         # Si no tiene target o stop loss, fijarlo cuantitativamente
+        # Mismos lados que strategies.py: largo sube al objetivo y baja al stop.
         if target_price <= 0 or target_price == entry_price:
-            if side == "BUY":
+            if is_long_side(side):
                 target_price = min(0.99, entry_price + max(0.04, edge if edge > 0 else 0.05))
             else:
                 target_price = max(0.01, entry_price - max(0.04, edge if edge > 0 else 0.05))
 
         if stop_loss <= 0 or stop_loss == entry_price:
-            if side == "BUY":
+            if is_long_side(side):
                 stop_loss = max(0.01, entry_price * 0.92)
             else:
                 stop_loss = min(0.99, entry_price * 1.08)
@@ -273,13 +376,13 @@ class PaperTradingEngine:
         signal["hours_to_resolve"] = horizon_info["hours_left"]
 
         # Dimensionamiento Dinámico Kelly con Multiplicador de Auto-Aprendizaje IA
-        closed_pnl = sum(t.get("realized_pnl_usd", 0.0) for t in self.trades.values() if t.get("status") in ("WON", "LOST"))
+        closed_pnl = sum(t.get("realized_pnl_usd", 0.0) for t in self.accounted_trades() if t.get("status") in ("WON", "LOST"))
         current_equity = max(200.0, self.initial_balance + closed_pnl)
 
         # Kelly con edge real: mezclar la confianza de la señal con el win rate empírico de la estrategia
         kelly_confidence = confidence
         _sg_code = signal.get("strategy_code", "GEN")
-        _strat_closed = [t for t in self.trades.values() if t.get("strategy_code") == _sg_code and t.get("status") in ("WON", "LOST")]
+        _strat_closed = [t for t in self.accounted_trades() if t.get("strategy_code") == _sg_code and t.get("status") in ("WON", "LOST")]
         # Guarda de muestra: con pocos trades el win rate empírico es ruido y
         # mezclarlo con la confianza infla el sizing justo cuando no hay evidencia.
         if len(_strat_closed) >= PAPER_MIN_TRADES_FOR_EMPIRICAL_WR:
@@ -355,9 +458,13 @@ class PaperTradingEngine:
         signal["drawdown_protection_factor"] = round(drawdown_factor, 2)
         signal["current_drawdown_pct"] = round(current_dd * 100.0, 2)
 
-        liquidity = to_float(getattr(market, "liquidity", 0), 0.0)
-        volume_24h = to_float(getattr(market, "volume_24h", 0), 0.0)
-        open_interest = to_float(getattr(market, "open_interest", 0), 0.0)
+        # `_market_field` y no `getattr`: el auto-sniper de lead-lag pasa el mercado
+        # como dict y `getattr(dict, "liquidity")` devuelve 0, así que TODOS los
+        # snipes se descartaban como illíquidos mientras el dashboard anunciaba
+        # EXECUTED_AUTO (0 trades de LL_SNIPER en el track record).
+        liquidity = to_float(self._market_field(market, "liquidity", 0), 0.0)
+        volume_24h = to_float(self._market_field(market, "volume_24h", 0), 0.0)
+        open_interest = to_float(self._market_field(market, "open_interest", 0), 0.0)
 
         # Kalshi publica liquidity_dollars en 0.00 para la gran mayoria de mercados
         # y su volumen 24h rara vez alcanza miles. Exigir solo `liquidity` dejaba al
@@ -460,7 +567,10 @@ class PaperTradingEngine:
         fill = execution_model.entry_fill_with_budget(
             market,
             signal.get("token", "Yes"),
-            side,
+            # El modelo de ejecución solo entiende BUY/SELL: sin normalizar, "BOTH"
+            # se cruzaba como venta (bid) y luego se cerraba como compra (ask), es
+            # decir ganaba el spread en las dos patas.
+            entry_order_side(side),
             entry_price,
             trade_size_usd,
             is_maker=is_maker,
@@ -482,6 +592,56 @@ class PaperTradingEngine:
         signal["fill_partial"] = fill.partial
         signal["fill_book_synthetic"] = fill.book_synthetic
         signal["capital_exposure_usd"] = round(total_open_exposure + trade_size_usd, 2)
+
+        # ===== Anclaje del riesgo al precio REAL de ejecución =====
+        # La señal calculó stop y objetivo sobre SU precio (`entry_price`). Cuando el
+        # fill llega a otro nivel (libro del outcome contrario, o señal ya caducada en
+        # un mercado que se movió) el stop queda del lado equivocado de la entrada
+        # real y la operación se cierra en el ciclo siguiente: así murieron 100/108
+        # trades de S20, 35/36 de S23, 32/32 de S21 y 22/41 de S02, con 0.0 min de
+        # vida media y win rate 0-8%. No es un resultado de la estrategia: es el
+        # harness midiéndose a sí mismo.
+        drift = abs(exec_price - entry_price)
+        drift_limit = max(PAPER_ENTRY_DRIFT_MIN_ABS, PAPER_ENTRY_DRIFT_PCT * entry_price)
+        if drift > drift_limit:
+            signal["execution_skipped"] = (
+                f"desvio_entrada: senal {entry_price:.4f} vs ejecucion {exec_price:.4f} "
+                f"(>{drift_limit:.4f})"
+            )
+            return None
+
+        if drift > 0:
+            # Mismo diseño de riesgo, precio real: reescalar stop y objetivo por el
+            # cociente preserva el R:R que la estrategia definió (es invariante a la
+            # escala) pero lo ata al nivel al que se entró de verdad. Las bandas de
+            # seguridad evitan que el redondeo deje el stop pegado a la entrada.
+            scale = exec_price / entry_price
+            stop_loss = round(max(0.01, min(0.99, stop_loss * scale)), 4)
+            target_price = round(max(0.01, min(0.99, target_price * scale)), 4)
+            _edge_margin = max(0.04, edge if edge > 0 else 0.05)
+            if is_long_side(side):
+                if stop_loss >= exec_price:
+                    stop_loss = max(0.01, round(exec_price * 0.92, 4))
+                if target_price <= exec_price:
+                    target_price = min(0.99, round(exec_price + _edge_margin, 4))
+            else:
+                if stop_loss <= exec_price:
+                    stop_loss = min(0.99, round(exec_price * 1.08, 4))
+                if target_price >= exec_price:
+                    target_price = max(0.01, round(exec_price - _edge_margin, 4))
+            signal["entry_anchor_scale"] = round(scale, 4)
+            signal["stop_loss"] = f"{stop_loss:.4f}"
+            signal["target_price"] = f"{target_price:.4f}"
+
+        # Invariante del harness: no se registra ninguna operación cuya geometría no
+        # sea alcanzable respecto a la entrada real (largo con stop debajo y objetivo
+        # encima; corto al revés). Una geometría imposible garantiza una pérdida.
+        if not entry_geometry_valid(exec_price, stop_loss, target_price, side):
+            signal["execution_skipped"] = (
+                f"geometria_invalida: entrada {exec_price:.4f} stop {stop_loss:.4f} "
+                f"objetivo {target_price:.4f} lado {side}"
+            )
+            return None
 
         # Spread en la entrada: forma parte del contexto con el que el bandit
         # aprende, porque un spread amplio cambia el resultado esperado.
@@ -516,11 +676,15 @@ class PaperTradingEngine:
             "fill_book_synthetic": fill.book_synthetic,
             "slippage_ticks": round(fill.slippage_ticks, 2),
             "signal_entry_price": entry_price,
+            "entry_drift": round(drift, 4),
+            "record_scope": PAPER_RECORD_SCOPE,
             "current_price": round(exec_price, 4),
-            "target_price": target_price,
-            "stop_loss": stop_loss,
-            "initial_stop_loss": stop_loss,
-            "peak_price": entry_price,
+            "target_price": round(target_price, 4),
+            "stop_loss": round(stop_loss, 4),
+            "initial_stop_loss": round(stop_loss, 4),
+            # El pico arranca en el precio de EJECUCIÓN, no en el de la señal: si
+            # arrancaba por encima, el break-even se activaba en el primer ciclo.
+            "peak_price": round(exec_price, 4),
             "break_even_active": False,
             "trailing_stop_active": False,
             "trailing_stop_price": None,
@@ -558,16 +722,19 @@ class PaperTradingEngine:
 
         Para cerrar un largo hay que vender al BID; para cerrar un corto, comprar
         al ASK. Evaluar la salida contra el precio medio (como antes) daba el
-        objetivo por alcanzado medio spread antes de tiempo.
+        objetivo por alcanzado medio spread antes de tiempo. Los lados BOTH /
+        BUY_BUNDLE son largos (ver LONG_SIDES): usar el ask para ellos daba la
+        salida por buena al precio en el que se compra, no en el que se vende.
         """
+        long_position = is_long_side(side)
         book = self._market_field(market, "order_book", {}) or {}
         side_books = book.get(token_name) or {}
-        rows = side_books.get("bids" if side == "BUY" else "asks") or []
-        levels = normalize_levels(rows, descending=(side == "BUY"))
+        rows = side_books.get("bids" if long_position else "asks") or []
+        levels = normalize_levels(rows, descending=long_position)
         if levels:
             return levels[0][0]
         quotes = self._market_field(
-            market, "best_bid" if side == "BUY" else "best_ask", {}
+            market, "best_bid" if long_position else "best_ask", {}
         ) or {}
         return to_float(quotes.get(token_name), 0.0)
 
@@ -577,6 +744,7 @@ class PaperTradingEngine:
         market: Any,
         status: str,
         reason: str,
+        record_scope: Optional[str] = None,
     ) -> bool:
         """Cierra un trade ejecutando la salida contra el libro y cobrando su comisión.
 
@@ -589,8 +757,9 @@ class PaperTradingEngine:
         entry = to_float(trade.get("entry_price"), 0.0)
         entry_fee = to_float(trade.get("entry_fee_usd"), 0.0)
         side = trade.get("side", "BUY")
+        long_position = is_long_side(side)
         # Cerrar un largo es vender; cerrar un corto es comprar.
-        exit_side = "SELL" if side == "BUY" else "BUY"
+        exit_side = exit_order_side(side)
         sweep_limit = 0.01 if exit_side == "SELL" else 0.99
 
         fill = execution_model.exit_fill(
@@ -627,10 +796,18 @@ class PaperTradingEngine:
         if shares <= 0:
             return False
 
-        entry_cost = shares * entry + entry_fee
-        gross_exit = executed * exit_price
-        realized = gross_exit - exit_fee - entry_cost
-        realized_pct = (realized / entry_cost * 100.0) if entry_cost > 0 else 0.0
+        entry_notional = shares * entry
+        exit_notional = shares * exit_price
+        if long_position:
+            # Largo: se paga la entrada (notional + comisión) y se cobra la salida.
+            basis = entry_notional + entry_fee
+            realized = exit_notional - exit_fee - basis
+        else:
+            # Corto: se cobra la entrada y se paga la recompra, que es lo caro. Con
+            # la fórmula del largo un corto ganador aparecía como pérdida.
+            basis = entry_notional - entry_fee
+            realized = basis - (exit_notional + exit_fee)
+        realized_pct = (realized / basis * 100.0) if basis > 0 else 0.0
 
         trade["status"] = status
         trade["realized_pnl_usd"] = round(realized, 2)
@@ -642,6 +819,68 @@ class PaperTradingEngine:
         trade["exit_price"] = round(exit_price, 4)
         trade["exit_fee_usd"] = round(exit_fee, 4)
         trade["total_fees_usd"] = round(entry_fee + exit_fee, 4)
+        if record_scope:
+            # Un cierre forzado (mercado muerto) no pertenece a la estadística de la
+            # estrategia: se conserva con su propia marca, fuera de win rate y Kelly.
+            trade["record_scope"] = record_scope
+        return True
+
+    def _register_stale_market(self, trade: Dict[str, Any]) -> bool:
+        """Marca un ciclo sin mercado ni precio y cierra la posición si ya es un zombi.
+
+        Una posición abierta cuyo mercado dejó de cotizar no se puede valorar ni
+        cerrar: se queda ocupando cupo y capital para siempre. Había 12 así, con
+        hasta 23 h de antigüedad, y dejaban el tracker realista congelado en 12/12
+        posiciones: ninguna señal nueva podía entrar. Se cierra al último precio
+        conocido pagando su comisión (conservador: no se reclama ningún pago por
+        resolución del mercado) y se marca con PAPER_ZOMBIE_SCOPE para que no
+        contamine la estadística de la estrategia.
+
+        Devuelve True si el trade cambió y hay que persistir.
+        """
+        if not trade.get("stale_since"):
+            trade["stale_since"] = trade.get("opened_at") or utc_now().isoformat()
+        try:
+            since = datetime.fromisoformat(str(trade["stale_since"]).replace("Z", "+00:00"))
+        except Exception:
+            return False
+        hours = (utc_now() - since).total_seconds() / 3600.0
+        if hours < PAPER_ZOMBIE_HOURS:
+            return False
+
+        side = trade.get("side", "BUY")
+        long_position = is_long_side(side)
+        shares = to_float(trade.get("shares"), 0.0)
+        entry = to_float(trade.get("entry_price"), 0.0)
+        entry_fee = to_float(trade.get("entry_fee_usd"), 0.0)
+        mark = to_float(trade.get("current_price"), 0.0) or entry
+        exit_fee = execution_model.fee(shares, mark, is_maker=False) if shares > 0 and mark > 0 else 0.0
+
+        if long_position:
+            realized = shares * mark - exit_fee - (shares * entry + entry_fee)
+            basis = shares * entry + entry_fee
+        else:
+            realized = (shares * entry - entry_fee) - (shares * mark + exit_fee)
+            basis = shares * entry - entry_fee
+
+        trade["status"] = "WON" if realized >= 0 else "LOST"
+        trade["realized_pnl_usd"] = round(realized, 2)
+        trade["realized_pnl_pct"] = round(realized / basis * 100.0, 2) if basis > 0 else 0.0
+        trade["unrealized_pnl_usd"] = 0.0
+        trade["unrealized_pnl_pct"] = 0.0
+        trade["exit_price"] = round(mark, 4)
+        trade["exit_fee_usd"] = round(exit_fee, 4)
+        trade["total_fees_usd"] = round(entry_fee + exit_fee, 4)
+        trade["closed_at"] = utc_now().isoformat()
+        trade["close_reason"] = (
+            f"🧟 Cierre forzado: mercado sin cotización viva durante {hours:.1f}h "
+            f"(valorado al último precio {mark:.4f})"
+        )
+        trade["record_scope"] = PAPER_ZOMBIE_SCOPE
+        print(
+            f"[PaperTrading] Posición zombi cerrada {trade.get('trade_id')} "
+            f"({trade.get('strategy_code')}): {hours:.1f}h sin mercado, PnL {realized:+.2f} USD"
+        )
         return True
 
     def update_live_prices(self, market_registry):
@@ -655,6 +894,11 @@ class PaperTradingEngine:
             market_id = trade.get("market_id")
             market = market_registry.get_market(market_id)
             if not market:
+                # El mercado desapareció del registro (resuelto y fuera del
+                # universo): la posición no se puede valorar ni cerrar. Si lleva
+                # así lo suficiente es un zombi y libera su cupo y su capital.
+                if self._register_stale_market(trade):
+                    changed = True
                 continue
 
             token_name = trade.get("token", "Yes")
@@ -674,7 +918,15 @@ class PaperTradingEngine:
 
             curr_float = to_float(current_p, 0.0)
             if curr_float <= 0:
+                # Mercado presente pero sin precio publicable: misma situación que
+                # un mercado ausente (no se puede valorar la posición).
+                if self._register_stale_market(trade):
+                    changed = True
                 continue
+
+            # El mercado volvió a cotizar: la racha de silencio se reinicia.
+            if trade.pop("stale_since", None) is not None:
+                changed = True
 
             token_name = trade.get("token", "Yes")
             # El target/stop se evalúa contra el precio al que realmente se sale
@@ -687,9 +939,14 @@ class PaperTradingEngine:
             target = trade["target_price"]
             shares = trade["shares"]
             side = trade["side"]
+            # BOTH / BUY_BUNDLE son largos (ver LONG_SIDES). En la rama corta su
+            # take profit era "el precio baja al objetivo" y su stop "el precio
+            # sube al stop": con el stop por debajo de la entrada, el stop se
+            # disparaba al instante y el cierre se etiquetaba mal.
+            long_position = is_long_side(side)
 
             # Cálculo de PnL Flotante
-            if side == "BUY":
+            if long_position:
                 pnl_usd = (curr_float - entry) * shares
                 pnl_pct = ((curr_float - entry) / entry) * 100.0
 
@@ -736,7 +993,7 @@ class PaperTradingEngine:
                         ),
                     ) or changed
 
-            else:  # SELL
+            else:  # Corto genuino (SELL / SELL_BUNDLE)
                 pnl_usd = (entry - curr_float) * shares
                 pnl_pct = ((entry - curr_float) / entry) * 100.0
 
@@ -809,26 +1066,37 @@ class PaperTradingEngine:
             try:
                 from ai_learning_engine import ai_learning_engine
                 from quant_ml_engine import quant_ml
+                legacy_marked = False
                 for tr in self.trades.values():
-                    if tr.get("status") in ("WON", "LOST") and not tr.get("ai_post_mortem_done"):
-                        ai_learning_engine.analyze_trade_post_mortem(tr)
-                        
-                        # Actualización Online de LinUCB Contextual Bandit y Conformal Prediction
-                        strat_code = tr.get("strategy_code", "GEN")
-                        outcome = 1 if tr.get("status") == "WON" else 0
-                        pnl = to_float(tr.get("realized_pnl_usd", 0.0), 0.0)
-                        # Recompensa por PnL normalizado, no por acierto. Con ±1 el
-                        # bandit escalaba capital hacia la estrategia con mejor
-                        # hit-rate aunque perdiera dinero (9 ganancias de +$1 y una
-                        # pérdida de -$500 puntuaban 9:1 a favor).
-                        risk_budget = max(1.0, to_float(tr.get("position_size_usd"), 1.0))
-                        reward = max(-1.0, min(1.0, pnl / risk_budget))
-                        tr["bandit_reward"] = round(reward, 4)
-                        ctx = quant_ml.bandit.get_context_for_trade(tr)
-                        quant_ml.bandit.update_online(strat_code, ctx, reward)
-                        quant_ml.conformal.record_ground_truth(to_float(tr.get("confidence", 80.0), 80.0), outcome)
-                        
-                        tr["ai_post_mortem_done"] = True
+                    if tr.get("status") not in ("WON", "LOST") or tr.get("ai_post_mortem_done"):
+                        continue
+                    if self.scope_of(tr) != PAPER_RECORD_SCOPE:
+                        # El aprendizaje ni el bandit pueden entrenarse con el registro
+                        # sesgado: se marca como excluido (una sola vez) en vez de
+                        # reprocesarlo en cada ciclo.
+                        tr["ai_post_mortem_done"] = "excluded_legacy_scope"
+                        legacy_marked = True
+                        continue
+                    ai_learning_engine.analyze_trade_post_mortem(tr)
+
+                    # Actualización Online de LinUCB Contextual Bandit y Conformal Prediction
+                    strat_code = tr.get("strategy_code", "GEN")
+                    outcome = 1 if tr.get("status") == "WON" else 0
+                    pnl = to_float(tr.get("realized_pnl_usd", 0.0), 0.0)
+                    # Recompensa por PnL normalizado, no por acierto. Con ±1 el
+                    # bandit escalaba capital hacia la estrategia con mejor
+                    # hit-rate aunque perdiera dinero (9 ganancias de +$1 y una
+                    # pérdida de -$500 puntuaban 9:1 a favor).
+                    risk_budget = max(1.0, to_float(tr.get("position_size_usd"), 1.0))
+                    reward = max(-1.0, min(1.0, pnl / risk_budget))
+                    tr["bandit_reward"] = round(reward, 4)
+                    ctx = quant_ml.bandit.get_context_for_trade(tr)
+                    quant_ml.bandit.update_online(strat_code, ctx, reward)
+                    quant_ml.conformal.record_ground_truth(to_float(tr.get("confidence", 80.0), 80.0), outcome)
+
+                    tr["ai_post_mortem_done"] = True
+                if legacy_marked:
+                    self.save_to_disk()
             except Exception:
                 pass
 
@@ -836,25 +1104,32 @@ class PaperTradingEngine:
         try:
             from strategy_governor import governor
             by_code = {}
-            for t in self.trades.values():
+            for t in self.accounted_trades():
                 if t.get("status") in ("WON", "LOST"):
                     by_code.setdefault(t.get("strategy_code", "GEN"), []).append(t)
             for code, closed in by_code.items():
                 budget = self.budget_per_strategy if self.budget_mode == "per_strategy" else self.initial_balance
                 governor.evaluate_strategy(code, closed, budget)
             if self.budget_mode == "global":
-                realized = sum(to_float(t.get("realized_pnl_usd", 0.0), 0.0) for t in self.trades.values() if t.get("status") in ("WON", "LOST"))
+                realized = sum(to_float(t.get("realized_pnl_usd", 0.0), 0.0) for t in self.accounted_trades() if t.get("status") in ("WON", "LOST"))
                 governor.update_portfolio_drawdown(self.initial_balance + realized, self.initial_balance)
         except Exception:
             pass
 
     def get_summary(self) -> Dict[str, Any]:
-        """Calcula métricas agregadas del track record incluyendo Sharpe, Drawdown y Equity Curve."""
+        """Calcula métricas agregadas del track record incluyendo Sharpe, Drawdown y Equity Curve.
+
+        Las métricas de decisión salen sólo del alcance vigente (`accounted_trades`):
+        incluye el inventario abierto heredado, porque su capital está comprometido y
+        su flotante es dinero vivo, pero deja fuera los cierres anteriores al harness
+        corregido. Lo excluido se publica en `scope` para que la exclusión sea visible.
+        """
         trades_list = list(self.trades.values())
         trades_list.sort(key=lambda x: x.get("opened_at", ""), reverse=True)
 
-        open_trades = [t for t in trades_list if t.get("status") == "OPEN"]
-        closed_trades = [t for t in trades_list if t.get("status") in ("WON", "LOST")]
+        accounted = self.accounted_trades()
+        open_trades = [t for t in accounted if t.get("status") == "OPEN"]
+        closed_trades = [t for t in accounted if t.get("status") in ("WON", "LOST")]
         winning_trades = [t for t in closed_trades if t.get("status") == "WON"]
         losing_trades = [t for t in closed_trades if t.get("status") == "LOST"]
 
@@ -941,7 +1216,7 @@ class PaperTradingEngine:
             "sharpe_ratio": sharpe,
             "max_drawdown_pct": round(max_drawdown_pct, 2),
             "expectancy_usd": expectancy_usd,
-            "total_trades": len(trades_list),
+            "total_trades": len(accounted),
             "open_trades_count": len(open_trades),
             "winning_trades_count": len(winning_trades),
             "losing_trades_count": len(losing_trades),
@@ -949,6 +1224,9 @@ class PaperTradingEngine:
             "open_positions": open_trades,
             "history": closed_trades[:50],
             "all_trades": trades_list[:100],
+            # Qué se excluye y por qué: la exclusión tiene que ser auditable, no un
+            # borrado silencioso que haga parecer limpio lo que no lo era.
+            "scope": self.legacy_stats(),
             "updated_at": utc_now().isoformat(),
         }
 
@@ -1078,6 +1356,11 @@ class PaperTradingEngine:
         }
 
         trades_list = list(self.trades.values())
+        # Los números por estrategia salen del alcance vigente (con su inventario
+        # abierto), pero el catálogo se completa con todos los códigos vistos, para
+        # que una estrategia con historial heredado siga apareciendo en el panel con
+        # su muestra limpia a cero en lugar de desaparecer sin explicación.
+        scoped_list = self.accounted_trades()
         codes_in_trades = set(t.get("strategy_code") for t in trades_list if t.get("strategy_code"))
         all_codes = list(catalog.keys())
         for c in codes_in_trades:
@@ -1098,7 +1381,7 @@ class PaperTradingEngine:
                 "description": "Estrategia cuantitativa automatizada.",
             })
 
-            strat_trades = [t for t in trades_list if t.get("strategy_code") == code]
+            strat_trades = [t for t in scoped_list if t.get("strategy_code") == code]
             open_trades = [t for t in strat_trades if t.get("status") == "OPEN"]
             closed_trades = [t for t in strat_trades if t.get("status") in ("WON", "LOST")]
             won_trades = [t for t in closed_trades if t.get("status") == "WON"]

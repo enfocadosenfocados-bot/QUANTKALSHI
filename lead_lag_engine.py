@@ -285,49 +285,111 @@ class LeadLagEngine:
                 if self.auto_snipe:
                     self._auto_execute_snipe(opp)
 
+    @staticmethod
+    def build_snipe_context(opp: LeadLagOpportunity) -> tuple:
+        """Signal + mercado del snipe, tal como los consumen paper y Kalshi.
+
+        Un único constructor para el disparo automático y para el botón del dashboard:
+        dos copias divergen con el tiempo y la que se usa en live acaba enviando
+        precios distintos de los que se registraron en paper.
+        """
+        # Quotes en el formato que consumen el modelo de ejecución y el paper
+        # tracker (`best_bid`/`best_ask` por token). Sin ellas el libro llegaba
+        # vacío y el snipe se descartaba en silencio tanto en el disparo automático
+        # como en el botón del dashboard. El ask observado en el CLOB es lo que
+        # cuesta entrar ahora; el bid queda un tick por debajo.
+        other = "No" if opp.outcome == "Yes" else "Yes"
+        best_ask = opp.clob_price
+        best_bid = max(0.01, round(best_ask - 0.01, 3))
+        other_ask = max(0.01, round(1.0 - best_bid, 3))
+        other_bid = max(0.01, round(other_ask - 0.01, 3))
+        market = {
+            "market_id": opp.target_market_id,
+            "question": opp.market_question,
+            "category": "Crypto",
+            "condition_id": opp.condition_id,
+            "liquidity": 25000.0,
+            "volume_24h": 75000.0,
+            "end_date_iso": None,
+            "tick_size": 0.01,
+            "best_ask": {opp.outcome: best_ask, other: other_ask},
+            "best_bid": {opp.outcome: best_bid, other: other_bid},
+            "mid_price": {"Yes": opp.clob_price, "No": round(1.0 - opp.clob_price, 3)},
+            "prices": {"Yes": opp.clob_price, "No": round(1.0 - opp.clob_price, 3)},
+        }
+        signal = {
+            "signal_id": opp.id,
+            "strategy": "Lead-Lag Latency Sniping",
+            "strategy_code": "LL_SNIPER",
+            "token": opp.outcome,
+            "side": "BUY",
+            "confidence": 92.0,
+            "edge": round(opp.edge_pct / 100.0, 3),
+            "entry_price": opp.clob_price,
+            "market_price": opp.clob_price,
+            "market_question": opp.market_question,
+            "market_category": "Crypto",
+            "target_price": opp.implied_fair_price,
+            "stop_loss": round(opp.clob_price * 0.94, 3),
+            "timestamp": opp.detected_at,
+            "dedupe_key": f"LL:{opp.target_market_id}:{opp.outcome}:{int(opp.detected_at // 30)}",
+        }
+        return signal, market
+
     def _auto_execute_snipe(self, opp: LeadLagOpportunity):
         """Ejecuta automáticamente la orden sin intervención manual del usuario."""
         try:
             from paper_tracker import paper_tracker
             from live_execution import live_manager
 
-            fake_market = {
-                "market_id": opp.target_market_id,
-                "question": opp.market_question,
-                "category": "Crypto",
-                "condition_id": opp.condition_id,
-                "liquidity": 25000.0,
-                "volume_24h": 75000.0,
-                "end_date_iso": None,
-                "mid_price": {"Yes": opp.clob_price, "No": round(1.0 - opp.clob_price, 3)},
-                "prices": {"Yes": opp.clob_price, "No": round(1.0 - opp.clob_price, 3)},
-            }
-            signal = {
-                "signal_id": opp.id,
-                "strategy": "Lead-Lag Latency Sniping",
-                "strategy_code": "LL_SNIPER",
-                "token": opp.outcome,
-                "side": "BUY",
-                "confidence": 92.0,
-                "edge": round(opp.edge_pct / 100.0, 3),
-                "entry_price": opp.clob_price,
-                "market_price": opp.clob_price,
-                "market_question": opp.market_question,
-                "market_category": "Crypto",
-                "target_price": opp.implied_fair_price,
-                "stop_loss": round(opp.clob_price * 0.94, 3),
-                "timestamp": opp.detected_at,
-                "dedupe_key": f"LL:{opp.target_market_id}:{opp.outcome}:{int(opp.detected_at // 30)}",
-            }
-            paper_tracker.record_signal(signal, fake_market)
+            signal, market = self.build_snipe_context(opp)
+            trade = paper_tracker.record_signal(signal, market)
+            if not trade:
+                # El gestor de riesgo de paper la rechazó (duplicada, sin liquidez,
+                # exposición al límite). Enviarla igualmente a dinero real saltaría
+                # justamente el filtro que se supone que la valida.
+                logger.info(
+                    f"[AUTO-SNIPER] Senal descartada por el gestor de paper: {opp.symbol} {opp.outcome}; no se envia a live."
+                )
+                return
             opp.status = "EXECUTED_AUTO"
 
             if live_manager.is_live and not live_manager.kill_switch_active:
-                asyncio.create_task(live_manager.execute_order(signal))
+                # El tamaño lo calcula el paper tracker (Kelly + multiplicador de
+                # estrategia + factor de drawdown) y se pasa EXPLÍCITO: antes se llamaba
+                # con 1 de los 3 argumentos, el TypeError se lo comía el except de abajo
+                # y el camino de dinero real quedaba muerto sin más rastro que un log.
+                size_usd = float(
+                    signal.get("position_size_usd") or trade.get("position_size_usd") or 0.0
+                )
+                asyncio.create_task(self._send_live_order(live_manager, signal, market, size_usd))
 
-            logger.info(f"⚡ [AUTO-SNIPER 100% AUTOMÁTICO] Posición abierta: {opp.symbol} {opp.outcome} @ ${opp.clob_price} | Edge: +{opp.edge_pct}%")
+            logger.info(f"⚡ [AUTO-SNIPER 100% AUTOMÁTICO] Posición registrada: {opp.symbol} {opp.outcome} @ ${opp.clob_price} | Edge: +{opp.edge_pct}%")
         except Exception as e:
             logger.error(f"Error en auto-snipe: {e}")
+
+    async def _send_live_order(self, live_manager, signal, market, size_usd: float):
+        """Envía la orden real y deja rastro del desenlace, se ejecute o no.
+
+        El fallo silencioso era parte del problema: una orden que moría en un TypeError
+        se veía igual que una orden que no había que enviar. Aquí los dos casos se
+        distinguen en el log, que es lo único que mira el operador a las 3 de la mañana.
+        """
+        try:
+            result = await live_manager.execute_order(signal, market, size_usd)
+        except Exception as exc:
+            logger.error(f"[AUTO-SNIPER] Excepcion enviando orden live: {type(exc).__name__}: {exc}")
+            return
+        if result.get("executed"):
+            logger.info(
+                f"[AUTO-SNIPER] Orden LIVE enviada: {signal.get('market_question')} "
+                f"${size_usd:.2f} -> order_id={result.get('order_id')}"
+            )
+            return
+        logger.warning(
+            f"[AUTO-SNIPER] Orden LIVE NO ejecutada "
+            f"(motivo: {result.get('blocked_by') or 'error'}): {result.get('error')}"
+        )
 
     async def _run_polymarket_matcher(self):
         """Mantiene actualizados los contratos de cripto flash de Polymarket."""
@@ -340,11 +402,15 @@ class LeadLagEngine:
                     if (now - o.detected_at) < o.expiration_seconds
                 ]
 
-                # Si no hay contratos registrados externamente, generamos los tracks de mercado
-                if not self.tracked_polymarket_contracts and self.tickers["BTC"].price > 0:
-                    btc_p = self.tickers["BTC"].price
-                    eth_p = self.tickers["ETH"].price
-                    sol_p = self.tickers["SOL"].price
+                btc_p = self.tickers["BTC"].price
+                eth_p = self.tickers["ETH"].price
+                sol_p = self.tickers["SOL"].price
+
+                # Si no hay contratos registrados externamente, generamos los tracks de
+                # mercado. Solo con los tres precios ya recibidos: generar el respaldo
+                # antes de que llegue un ticker producia contratos absurdos
+                # ("Solana above $1", strike 1.5) que el sniper podia operar.
+                if not self.tracked_polymarket_contracts and btc_p > 0 and eth_p > 0 and sol_p > 0:
 
                     # Contratos de seguimiento sintéticos / mapeados con Polymarket
                     self.tracked_polymarket_contracts = [

@@ -16,6 +16,7 @@ from s21_conditional_arbitrage import ConditionalArbitrage
 from s22_news_latency_sniping import FastNewsSniping
 from s23_resolution_rules_lawyer import ResolutionRulesLawyer
 from s24_order_flow_imbalance import OrderFlowImbalance
+from position_side import is_long_side
 
 
 class StrategyEngine:
@@ -371,7 +372,7 @@ class StrategyEngine:
 
         entry_f = float(signal.market_price)
         target_f = max(0.001, min(0.999, float(signal.estimated_prob)))
-        if side == "BUY":
+        if is_long_side(side):
             if signal.strategy_name == "s20_oracle_delay_sniping":
                 stop_f = max(0.01, entry_f * 0.95)
             elif signal.strategy_name == "s24_order_flow_imbalance":

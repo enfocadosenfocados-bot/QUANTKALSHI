@@ -105,16 +105,30 @@ ssh -N -L 8000:127.0.0.1:8000 usuario@TU_VPS
 
 `KALSHI_ENV=production` es el plano de **datos** (los ~2.826 mercados con volumen
 viven ahi, por eso es el entorno normal del bot). Colocar ordenes con dinero real
-es un acto **distinto**, y el interlock exige las tres cosas a la vez:
+es un acto **distinto**, y el interlock exige las cuatro cosas a la vez:
 
 1. `KALSHI_ENV=production` en `.env`
 2. `ALLOW_REAL_MONEY=true` en `.env` (por defecto `false`)
 3. modo `LIVE` en el dashboard, kill-switch desactivado y `confirm_live_order=true`
    en la senal
+4. que el tablero de promocion marque la estrategia como `LIVE_PEQUENO` o `LIVE`
+   (`GET /api/promotion/board`). Con `LIVE_REQUIRE_PROMOTION=false` se puede saltar,
+   y por eso viene **activado** por defecto: sin la muestra que da potencia
+   estadistica, una ganadora de paper es indistinguible del azar.
 
-Ademas `LIVE_ABS_MAX_ORDER_USD` (por defecto 50 USD) es un tope duro por orden que
-**no** se puede subir desde el dashboard: es el freno de ultimo recurso contra un
-bug de sizing en el camino de dinero real.
+Y estos limites se comprueban **en el envio**, no solo en el informe:
+
+| Variable | Por defecto | Que evita |
+| --- | --- | --- |
+| `LIVE_ABS_MAX_ORDER_USD` | 50 | Un bug de sizing; no se puede subir desde el dashboard |
+| `MAX_OPEN_LIVE_TRADES` | 5 | N senales seguidas dejando N ordenes vivas a la vez |
+| `LIVE_ORDER_MAX_AGE_SEC` | 900 | Ordenes `good_till_canceled` que no caducan solas: la reconciliacion las cancela |
+
+Cada orden se envia con un `client_order_id` derivado de la senal, de modo que un
+reintento (timeout, reinicio, senal repetida) es un rechazo por duplicado y no una
+segunda posicion. Lo enviado queda en `live_orders.json` (`GET /api/live/orders`) y
+`POST /api/live/reconcile` cuadra ese registro con el exchange y cancela lo que
+quedo vivo; el bot tambien lo hace solo cada 2 minutos.
 
 Ruta recomendada: dejar `ALLOW_REAL_MONEY=false` unos dias, ver el PnL del paper
 trading en la VPS, validar el cableado de ordenes contra el exchange **demo**
@@ -166,6 +180,7 @@ sudo systemctl restart quantkalshi
 ```bash
 python -m unittest discover -p 'test_*.py'   # suite completa
 python -m unittest test_live_interlock -v    # interlock de dinero real
+python -m unittest test_live_wiring -v       # cableado y candados del envio live
 python -m unittest test_fee_calibration -v   # modelo de comisiones
 ```
 
@@ -342,6 +357,8 @@ silencio.
 | `GET /api/settings/trading-mode` | Estado PAPER/LIVE y credenciales |
 | `POST /api/settings/trading-mode` | Cambiar PAPER/LIVE |
 | `POST /api/live/kill-switch` | Boton de panico |
+| `GET /api/live/orders` | Ordenes reales enviadas, tope de abiertas y ultima reconciliacion |
+| `POST /api/live/reconcile` | Cuadrar el registro local con Kalshi y cancelar ordenes vivas |
 | `WS /ws` | WebSocket del dashboard |
 
 ## Arquitectura
@@ -364,7 +381,7 @@ Kalshi Trade API v2
     +-- execution_model.py    -> comision, tick, profundidad y fills realistas
     +-- paper_tracker.py      -> track record con guardado atomico
     +-- strategy_promotion.py -> puerta PAPER -> LIVE (Bonferroni + holdout)
-    +-- live_execution.py     -> PAPER por defecto, ordenes Kalshi protegidas
+    +-- live_execution.py     -> PAPER por defecto, ordenes Kalshi protegidas + reconciliacion
     +-- main.py               -> FastAPI + WebSocket del dashboard
 ```
 
@@ -372,8 +389,16 @@ Kalshi Trade API v2
 
 - El backend arranca en **PAPER**; `kalshi_credentials.json` no se crea hasta que
   cambies de modo explicitamente.
-- `execute_order` exige `mode=LIVE`, kill-switch desactivado, credenciales validas y
-  `confirm_live_order=true` en la senal. Sin eso devuelve solo un `dry_run_order`.
+- `execute_order(signal, market, size_usd)` exige `mode=LIVE`, kill-switch desactivado,
+  credenciales validas, `confirm_live_order=true` en la senal, `strategy_code` promovido
+  por el tablero, tamano explicito y hueco bajo `MAX_OPEN_LIVE_TRADES`. Si algo falla
+  devuelve `blocked_by` con el motivo (nunca un error generico) y solo un
+  `dry_run_order`. La firma se comprueba en `test_live_wiring.py`: un call-site con
+  menos de 3 argumentos rompe la suite, porque ese `TypeError` ya dejo el camino de
+  dinero real muerto una vez y solo se veia en el log.
+- Las ordenes enviadas se registran en `live_orders.json` (escritura atomica) y la
+  reconciliacion las cuadra contra el exchange: lo que ya no esta vivo se marca y lo
+  que sigue vivo pasado `LIVE_ORDER_MAX_AGE_SEC` se cancela.
 - Whale tracking queda **desactivado por defecto** porque Kalshi no expone wallets ni
   holders publicos. Se puede reactivar con `KALSHI_ENABLE_WHALE_TRACKING=true`, pero
   no producira datos utiles mientras no exista esa fuente.

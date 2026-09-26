@@ -65,6 +65,10 @@ strategy_governor.json
 fee_calibration.json
 state/
 
+# Registro de ordenes REALES enviadas (order_id, fills, comisiones). Es estado de
+# cuenta, no codigo: se recrea en el primer envio de cada arranque.
+live_orders.json
+
 # Copias de seguridad / archivados: contienen snapshots del codigo Y del .env
 # (con credenciales dentro). NUNCA deben entrar al repositorio.
 backup_*/

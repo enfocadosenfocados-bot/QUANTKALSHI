@@ -67,6 +67,27 @@ ALLOW_REAL_MONEY = os.getenv("ALLOW_REAL_MONEY", "").strip().lower() in {
 # de ultimo recurso contra un bug de sizing en el camino de dinero real.
 LIVE_ABS_MAX_ORDER_USD = float(os.getenv("LIVE_ABS_MAX_ORDER_USD", "50"))
 
+# Tope de ordenes reales vivas a la vez. Hasta ahora `max_open_live_trades` era un
+# numero que se publicaba en el dashboard pero que nadie comprobaba en el camino de
+# envio: N señales seguidas podian dejar N ordenes vivas sin freno.
+MAX_OPEN_LIVE_TRADES = int(os.getenv("MAX_OPEN_LIVE_TRADES", "5"))
+
+# Antiguedad maxima (segundos) de una orden real viva antes de que la reconciliacion
+# la cancele. `time_in_force=good_till_canceled` NO caduca sola: una orden viva a los
+# 15 minutos es una posicion que nadie decidio tomar.
+LIVE_ORDER_MAX_AGE_SEC = float(os.getenv("LIVE_ORDER_MAX_AGE_SEC", "900"))
+
+# Puerta de promocion en el camino de dinero real. El tablero de promocion
+# (strategy_promotion.py) existia, pero era informativo: nada impedia enviar a live
+# una estrategia en estado CANDIDATA o SOSPECHOSA. Con esto activo (por defecto) una
+# estrategia solo puede enviar ordenes reales si el tablero la marca LIVE_PEQUENO/LIVE.
+LIVE_REQUIRE_PROMOTION = os.getenv("LIVE_REQUIRE_PROMOTION", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
 KALSHI_REST_BASES: Dict[str, str] = {
     "demo": "https://external-api.demo.kalshi.co/trade-api/v2",
     "production": "https://external-api.kalshi.com/trade-api/v2",
@@ -268,6 +289,37 @@ PAPER_DEPTH_SAFETY = float(os.getenv("PAPER_DEPTH_SAFETY", "0.5"))
 # confianza de la senal. Con 5 trades el win rate es ruido, y mezclarlo inflaba
 # el sizing justo cuando no habia evidencia.
 PAPER_MIN_TRADES_FOR_EMPIRICAL_WR = int(os.getenv("PAPER_MIN_TRADES_FOR_EMPIRICAL_WR", "20"))
+
+# ========== Anclaje del riesgo al precio REAL de ejecucion ==========
+# La senal calcula stop y objetivo sobre SU precio (`entry_price`). Cuando el fill
+# llega a otro nivel (libro del outcome contrario, o senal ya vieja en un mercado
+# que se movio), el stop queda del lado equivocado de la entrada real y el tracker
+# cierra la operacion en el ciclo siguiente. Medido sobre el registro de research:
+# 100/108 trades de S20, 35/36 de S23, 32/32 de S21 y 22/41 de S02 murieron asi,
+# con 0.0 min de vida media y win rate 0-8%. Eso mide al harness, no a la
+# estrategia, y son perdidas garantizadas que no existen en un mercado real.
+#   PAPER_ENTRY_DRIFT_PCT     desvio relativo tolerado entre senal y ejecucion
+#   PAPER_ENTRY_DRIFT_MIN_ABS suelo absoluto (un tick de Kalshi ya es 0.01, y en
+#                             contratos de 0.02 un tick es el 50% del precio)
+# Un desvio mayor no se reancla: se descarta la operacion, porque la tesis con la
+# que se genero la senal ya no existe a ese precio.
+PAPER_ENTRY_DRIFT_PCT = float(os.getenv("PAPER_ENTRY_DRIFT_PCT", "0.15"))
+PAPER_ENTRY_DRIFT_MIN_ABS = float(os.getenv("PAPER_ENTRY_DRIFT_MIN_ABS", "0.02"))
+
+# ========== Alcance del registro (baseline de medicion) ==========
+# Solo los trades escritos por el harness corregido cuentan para win rate, Kelly,
+# gobernador, bandit y tablero de promocion. Los anteriores se conservan en el
+# mismo fichero para auditoria, pero fuera de las estadisticas: su muestra esta
+# envenenada por el bug de lado y por los stops anclados al precio de la senal.
+PAPER_RECORD_SCOPE = os.getenv("PAPER_RECORD_SCOPE", "harness_v2").strip() or "harness_v2"
+PAPER_LEGACY_SCOPE = "legacy_pre_harness_fix"
+PAPER_ZOMBIE_SCOPE = "harness_zombie"
+
+# Horas que una posicion abierta puede estar sin mercado ni precio antes de
+# cerrarse a la fuerza. Una posicion asi no se puede valorar ni cerrar: ocupaba
+# cupo y capital para siempre (habia 12 con hasta 23 h, y bloqueaban por completo
+# el tracker realista, que estaba en 12/12 posiciones abiertas sin operar).
+PAPER_ZOMBIE_HOURS = float(os.getenv("PAPER_ZOMBIE_HOURS", "6"))
 
 # Filtro de plausibilidad de senales. Evita floods de contratos sub-centavo
 # (p.ej. brackets de temperatura a 0.5c) donde un modelo simple reporta edges

@@ -29,6 +29,7 @@ from strategy_ranking import (
     sample_size_for_edge,
     wilson_interval,
 )
+from position_side import is_long_side
 
 Z95 = 1.96
 BONFERRONI_ALPHA = 0.05
@@ -69,6 +70,15 @@ STATE_PRIORITY = (
 # describe una operación real (fills instantáneos al precio soñado).
 IMPOSSIBLE_WIN_RATE = 0.99
 MIN_TRADES_FOR_INTEGRITY = 20
+# Un cierre etiquetado WON/LOST es un hecho sobre el precio, no una opinión: el
+# take profit de un largo se alcanza con la salida por encima de la entrada y su
+# stop se toca por debajo. Cuando la etiqueta contradice el precio de salida (o el
+# signo del PnL: un stop nunca cierra con beneficio, porque las comisiones solo
+# empeoran el resultado) el cierre no lo produjo el mercado sino un error de
+# contabilidad de lados. Se tolera un residuo mínimo de incoherencias por libros
+# finos (el cierre puede barrer la profundidad peor que el precio evaluado).
+INCOHERENT_CLOSE_MAX_RATIO = 0.02
+INCOHERENT_CLOSE_MIN_TRADES = 2
 
 STATE_LABELS = {
     "SIN_DATOS": "Sin datos suficientes",
@@ -95,17 +105,54 @@ STATE_ACTIONS = {
 # Reglas de integridad: estadísticas que no pueden venir de una operación real.
 # El modelo de ejecución viejo producía fill instantáneo al precio señalado, lo
 # que fabricaba win rates del 100% y a la vez PnL negativo (contradictorio).
-def _integrity_problems(wins: int, n: int, pnl: float) -> List[str]:
+def _incoherent_closes(closed: List[Dict[str, Any]]) -> int:
+    """Cuenta cierres cuya etiqueta contradice el precio de salida o el signo del PnL.
+
+    Largo: WON exige salida por encima de la entrada y LOST el stop por debajo.
+    Corto: al revés. Un LOST con PnL positivo es imposible en cualquier lado.
+    """
+    incoherent = 0
+    for trade in closed:
+        exit_price = _f(trade.get("exit_price"))
+        entry = _f(trade.get("entry_price"))
+        if exit_price <= 0 or entry <= 0:
+            # Sin precio de salida no se puede juzgar la etiqueta.
+            continue
+        favorable_move = exit_price - entry
+        if not is_long_side(trade.get("side")):
+            favorable_move = -favorable_move
+        won = trade.get("status") == "WON"
+        if (not won and _f(trade.get("realized_pnl_usd")) > 0) or (won and favorable_move < 0):
+            incoherent += 1
+    return incoherent
+
+
+def _integrity_problems(closed: List[Dict[str, Any]]) -> List[str]:
     problems: List[str] = []
+    n = len(closed)
+    wins = sum(1 for t in closed if t.get("status") == "WON")
+    pnl = sum(_f(t.get("realized_pnl_usd")) for t in closed)
     if n >= MIN_TRADES_FOR_INTEGRITY and wins / n >= IMPOSSIBLE_WIN_RATE:
         problems.append(
             f"{wins}/{n} operaciones ganadoras ({wins / n:.1%}): en mercados "
             "binarios ningún edge real gana casi todo"
         )
-    if wins == n and pnl <= 0:
+    if n > 0 and wins == n and pnl <= 0:
         problems.append(
             f"ganó las {n} operaciones pero el PnL es ${pnl:.2f}: el registro "
             "de pérdidas no cuadra"
+        )
+    incoherent = _incoherent_closes(closed)
+    if (
+        n > 0
+        and incoherent >= INCOHERENT_CLOSE_MIN_TRADES
+        and incoherent / n >= INCOHERENT_CLOSE_MAX_RATIO
+    ):
+        problems.append(
+            f"{incoherent}/{n} cierres ({incoherent / n:.1%}) con etiqueta contraria "
+            "al precio de salida (pérdidas cerradas con beneficio o ganadoras "
+            "cerradas por debajo de la entrada): el registro mezcla lados largos y "
+            "cortos, así que su win rate y su edge no son fiables"
         )
     return problems
 
@@ -234,7 +281,7 @@ def evaluate_strategy(
     sample_needed = sample_size_for_edge(overall["edge"], overall["breakeven"])
     significant = p_value < alpha and lo > overall["breakeven"]
     significantly_worse = p_value > 0.95 and hi < overall["breakeven"]
-    integrity = _integrity_problems(wins, n, overall["pnl_usd"])
+    integrity = _integrity_problems(closed)
 
     pnl_series: List[float] = []
     running = 0.0
@@ -275,7 +322,7 @@ def evaluate_strategy(
 
     if integrity:
         state = "SOSPECHOSA"
-        reason = "Estadísticas imposibles: " + "; ".join(integrity)
+        reason = "Registro no fiable: " + "; ".join(integrity)
         next_step = STATE_ACTIONS["SOSPECHOSA"]
     elif paused:
         state = "PAUSADA"
@@ -329,9 +376,15 @@ def evaluate_strategy(
 
 def build_promotion_board(paper_tracker, governor=None) -> Dict[str, Any]:
     """Tablero de promoción para todas las estrategias del paper trading."""
-    trades = list(getattr(paper_tracker, "trades", {}).values()) or []
+    # El veredicto se calcula sólo con el alcance vigente: un cierre anterior al
+    # harness corregido lo produjo un bug de medición (lado mal etiquetado y stop
+    # anclado al precio de la señal), así que no puede contar ni a favor ni en contra
+    # de una estrategia. La familia de comparaciones (Bonferroni) sí cuenta todo lo
+    # probado, para no relajar nunca el listón de significancia.
+    _scoped = getattr(paper_tracker, "accounted_trades", None)
+    trades = list(_scoped() if callable(_scoped) else getattr(paper_tracker, "trades", {}).values()) or []
     seen: List[str] = []
-    for trade in trades:
+    for trade in list(getattr(paper_tracker, "trades", {}).values()) or []:
         code = str(trade.get("strategy_code") or "GEN")
         if code not in seen:
             seen.append(code)

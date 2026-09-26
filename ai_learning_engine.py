@@ -156,9 +156,11 @@ class AILearningEngine:
         """Bucle en segundo plano que ejecuta la calibración y reajuste de Kelly de forma automática cada 60s."""
         while self.daily_loop_running:
             try:
-                from paper_tracker import paper_tracker, paper_tracker_research
-                closed_trades = [t for t in paper_tracker.trades.values() if t.get("status") in ("WON", "LOST")]
-                closed_trades += [t for t in paper_tracker_research.trades.values() if t.get("status") in ("WON", "LOST")]
+                from paper_tracker import closed_trades_of_scope, paper_tracker, paper_tracker_research
+                # Sólo el alcance vigente: el registro anterior lo produjo un bug de
+                # medición y entrenar con él sesga pesos y reglas.
+                closed_trades = closed_trades_of_scope(paper_tracker)
+                closed_trades += closed_trades_of_scope(paper_tracker_research)
                 self.run_daily_calibration(closed_trades)
             except Exception as e:
                 logger.error(f"Error en bucle auto_learning: {e}")
@@ -321,9 +323,9 @@ class AILearningEngine:
         logger.info(f"🧠 [IA REFLEXIÓN] Trade {trade_id} ({strategy_id}): {root_cause} | Regla: {actionable_rule}")
         # Disparo inmediato de auto-recalibración 100% automático al registrar una nueva reflexión
         try:
-            from paper_tracker import paper_tracker, paper_tracker_research
-            all_closed = [t for t in paper_tracker.trades.values() if t.get("status") in ("WON", "LOST")]
-            all_closed += [t for t in paper_tracker_research.trades.values() if t.get("status") in ("WON", "LOST")]
+            from paper_tracker import closed_trades_of_scope, paper_tracker, paper_tracker_research
+            all_closed = closed_trades_of_scope(paper_tracker)
+            all_closed += closed_trades_of_scope(paper_tracker_research)
             self.run_daily_calibration(all_closed)
         except Exception:
             pass

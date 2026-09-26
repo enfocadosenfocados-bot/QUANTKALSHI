@@ -8,6 +8,7 @@ Centraliza la auto-protección y auto-mejora del portfolio:
      mejorado el PnL histórico (walk-forward simple).
 """
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -52,19 +53,30 @@ class StrategyGovernor:
                 self.paused = {k: float(v) for k, v in (d.get("paused") or {}).items()}
                 self.rules = d.get("rules") or {}
                 self.global_paused_until = float(d.get("global_paused_until", 0.0))
-            except Exception:
-                pass
+            except Exception as exc:
+                # Antes esto era un `pass` silencioso: un fichero truncado borraba las
+                # pausas activas (el freno de una estrategia perdedora) sin dejar rastro.
+                print(f"[Governor] strategy_governor.json ilegible ({exc}); se arranca sin pausas.")
 
     def _save(self):
+        """Escritura atómica (tmp + replace).
+
+        El gobernador es parte de la cadena de seguridad: un `write_text` interrumpido
+        deja un JSON truncado que en el siguiente arranque se descarta en silencio y
+        libera estrategias que estaban pausadas por pérdidas.
+        """
         try:
-            self.storage_path.write_text(json.dumps({
+            payload = json.dumps({
                 "updated_at": time.time(),
                 "paused": self.paused,
                 "rules": self.rules,
                 "global_paused_until": self.global_paused_until,
-            }, indent=2, ensure_ascii=False), encoding="utf-8")
-        except Exception:
-            pass
+            }, indent=2, ensure_ascii=False)
+            tmp_path = self.storage_path.with_suffix(self.storage_path.suffix + ".tmp")
+            tmp_path.write_text(payload, encoding="utf-8")
+            os.replace(tmp_path, self.storage_path)
+        except Exception as exc:
+            print(f"[Governor] No se pudo guardar {self.storage_path.name}: {exc}")
 
     def is_paused(self, code: str) -> bool:
         return self.paused.get(code, 0.0) > time.time()

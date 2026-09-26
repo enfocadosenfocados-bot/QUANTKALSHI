@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from config import PAPER_LEGACY_SCOPE, PAPER_RECORD_SCOPE
 from paper_tracker import PaperTradingEngine
 
 
@@ -32,12 +33,24 @@ class TestPaperTradeDurability(unittest.TestCase):
 
     def test_save_then_load_roundtrip(self):
         tracker = self._tracker()
-        tracker.trades = {"S20:M1:Yes:BUY": self._trade()}
+        tracker.trades = {
+            "S20:M1:Yes:BUY": self._trade(),
+            "S21:M2:Yes:BOTH": {**self._trade("S21"), "record_scope": PAPER_RECORD_SCOPE},
+        }
         tracker.save_to_disk()
 
         self.assertTrue(self.path.exists())
-        self.assertEqual(self._tracker().trades, tracker.trades)
-        print("[TEST Durabilidad] guardar y recargar conserva los trades")
+        reloaded = self._tracker()
+        expected = json.loads(json.dumps(tracker.trades))
+        # Lo que se guardó sin marca es anterior al harness corregido: al cargarlo
+        # queda marcado como legado (visible para auditoría, fuera de las
+        # decisiones). Lo que ya trae alcance vigente se respeta tal cual.
+        expected["S20:M1:Yes:BUY"]["record_scope"] = PAPER_LEGACY_SCOPE
+        self.assertEqual(reloaded.trades, expected)
+        self.assertEqual(
+            reloaded.scope_of(reloaded.trades["S21:M2:Yes:BOTH"]), PAPER_RECORD_SCOPE
+        )
+        print("[TEST Durabilidad] guardar y recargar conserva los trades y su alcance")
 
     def test_save_leaves_no_temp_file_behind(self):
         tracker = self._tracker()

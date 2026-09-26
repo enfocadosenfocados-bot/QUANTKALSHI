@@ -73,6 +73,13 @@ def _bare_manager(
     manager.key_id = "test-key"
     manager.private_key_path = "test.pem"
     manager.kill_switch_active = kill_switch
+    # Estado del camino de dinero real en memoria: `orders_file=None` evita que un test
+    # escriba `live_orders.json` en el repositorio, que es la misma razón por la que
+    # `save_credentials` ya estaba anulado aquí.
+    manager.orders_file = None
+    manager.live_orders = {}
+    manager.last_reconcile = {}
+    manager._promotion_cache = {"at": 0.0, "result": None}
     manager.auth = types.SimpleNamespace(
         configured=authenticated,
         load_error=None if authenticated else "sin credenciales",
