@@ -29,14 +29,17 @@ fuente oficial**, no como arbitraje del oraculo UMA.
 ## Instalacion
 
 ```bat
-cd C:\Users\enfoc\.cline\data\workspaces\chat\QUANT-KALSHI
+git clone https://github.com/enfocadosenfocados-bot/QUANTKALSHI.git
+cd QUANTKALSHI
 python -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
 python main.py
 ```
 
-O en Windows: `start.bat`
+En Windows tambien puedes usar `start.bat` (supervisor 24/7). En **Linux/VPS**
+el despliegue completo es un solo comando: `bash deploy/install_vps.sh`
+(ver la seccion siguiente).
 
 - Dashboard: http://localhost:8000/dashboard
 - API REST: http://localhost:8000
