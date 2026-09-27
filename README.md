@@ -61,9 +61,13 @@ cd ~/quantkalshi
 bash deploy/install_vps.sh
 ```
 
-El repositorio es **publico**, asi que ese `git clone` no pide credenciales. Si en algun
-momento vuelve a ser privado, autentica antes (`gh auth login`) o clona con un token:
-`git clone https://<TOKEN>@github.com/enfocadosenfocados-bot/QUANTKALSHI.git`.
+El repositorio es **publico**, asi que ese `git clone` no pide credenciales. El nombre
+en GitHub **no lleva guion**: `QUANTKALSHI`. Una URL con guion (`QUANT-KALSHI`) no es
+este repositorio, y GitHub responde pidiendo usuario y contrasena
+(`fatal: could not read Username for 'https://github.com'`), que es exactamente lo que
+imprime tambien un repo privado: de ahi la confusion de creer que esta privado. Si en
+algun momento vuelve a ser privado, autentica antes (`gh auth login`) o clona con un
+token: `git clone https://<TOKEN>@github.com/enfocadosenfocados-bot/QUANTKALSHI.git`.
 
 `deploy/install_vps.sh` es idempotente (repetirlo repara/reinstala) y hace:
 
