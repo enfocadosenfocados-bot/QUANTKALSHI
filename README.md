@@ -197,7 +197,7 @@ Crea el archivo `.env` en la raiz del proyecto (esta en `.gitignore`):
 # auto | demo | production
 KALSHI_ENV=auto
 KALSHI_KEY_ID=tu_key_id
-KALSHI_PRIVATE_KEY_PATH=C:\Users\enfoc\.kalshi\demo_private_key.pem
+KALSHI_PRIVATE_KEY_PATH=C:\Users\TU_USUARIO\.kalshi\demo_private_key.pem
 KALSHI_WEBSOCKET_ENABLED=true
 MIN_LIQUIDITY=0
 MIN_VOLUME_24H=0
