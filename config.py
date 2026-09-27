@@ -306,6 +306,20 @@ PAPER_MIN_TRADES_FOR_EMPIRICAL_WR = int(os.getenv("PAPER_MIN_TRADES_FOR_EMPIRICA
 PAPER_ENTRY_DRIFT_PCT = float(os.getenv("PAPER_ENTRY_DRIFT_PCT", "0.15"))
 PAPER_ENTRY_DRIFT_MIN_ABS = float(os.getenv("PAPER_ENTRY_DRIFT_MIN_ABS", "0.02"))
 
+# ========== Spread maximo admisible en la entrada ==========
+# Un mercado cuyo spread se come una parte grande del precio no se puede operar: la
+# posicion nace valorada al bid (que es donde se sale) y el objetivo, calculado
+# sobre el ask de entrada, queda a un recorrido inalcanzable. Medido sobre el
+# registro real: S20 compro a 0.8756 un mercado con 0.38 de spread (43%) y S02
+# entro a 0.06 en libros de 0.01/0.06. En ambos el stop quedaba por encima del bid
+# y el primer ciclo cerraba la operacion: perdidas del harness, no de la estrategia.
+#   PAPER_MAX_SPREAD_PCT     spread maximo como fraccion del precio de ejecucion
+#   PAPER_MAX_SPREAD_MIN_ABS suelo absoluto, porque un tick de Kalshi ya es 0.01 y
+#                            en contratos de 0.05 un tick es el 20% del precio
+# El limite efectivo es el mayor de los dos.
+PAPER_MAX_SPREAD_PCT = float(os.getenv("PAPER_MAX_SPREAD_PCT", "0.05"))
+PAPER_MAX_SPREAD_MIN_ABS = float(os.getenv("PAPER_MAX_SPREAD_MIN_ABS", "0.03"))
+
 # ========== Alcance del registro (baseline de medicion) ==========
 # Solo los trades escritos por el harness corregido cuentan para win rate, Kelly,
 # gobernador, bandit y tablero de promocion. Los anteriores se conservan en el

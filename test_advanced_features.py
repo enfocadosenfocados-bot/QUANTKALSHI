@@ -90,9 +90,11 @@ class TestAdvancedFeatures(unittest.TestCase):
 
         class MockRegistry:
             def get_market(self, mid):
-                # El bid queda por encima del trailing stop resultante (0.8232),
-                # así que la posición sigue abierta y el trailing se activa.
-                return build_market(0.83, 0.85, 0.84)
+                # El pico se mide sobre el BID (0.84 = +5% sobre la entrada 0.80), que
+                # es el precio al que se sale: con el mid el mismo mercado marcaba un
+                # pico que el mercado no pagaba. El bid queda por encima del trailing
+                # stop resultante (0.8232), así que sigue abierto y el trailing se activa.
+                return build_market(0.84, 0.86, 0.85)
 
         engine.update_live_prices(MockRegistry())
         updated_trade = engine.trades["TEST:M1:Yes:BUY"]

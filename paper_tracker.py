@@ -28,6 +28,8 @@ try:
         PAPER_MIN_TRADES_FOR_EMPIRICAL_WR,
         PAPER_ENTRY_DRIFT_PCT,
         PAPER_ENTRY_DRIFT_MIN_ABS,
+        PAPER_MAX_SPREAD_PCT,
+        PAPER_MAX_SPREAD_MIN_ABS,
         PAPER_RECORD_SCOPE,
         PAPER_LEGACY_SCOPE,
         PAPER_ZOMBIE_SCOPE,
@@ -52,6 +54,8 @@ except ImportError:
     PAPER_MIN_TRADES_FOR_EMPIRICAL_WR = 20
     PAPER_ENTRY_DRIFT_PCT = 0.15
     PAPER_ENTRY_DRIFT_MIN_ABS = 0.02
+    PAPER_MAX_SPREAD_PCT = 0.05
+    PAPER_MAX_SPREAD_MIN_ABS = 0.03
     PAPER_RECORD_SCOPE = "harness_v2"
     PAPER_LEGACY_SCOPE = "legacy_pre_harness_fix"
     PAPER_ZOMBIE_SCOPE = "harness_zombie"
@@ -643,17 +647,83 @@ class PaperTradingEngine:
             )
             return None
 
-        # Spread en la entrada: forma parte del contexto con el que el bandit
-        # aprende, porque un spread amplio cambia el resultado esperado.
+        # ===== Spread y base REAL de salida =====
+        # El spread entra en el contexto del bandit, pero además es una puerta: en un
+        # libro donde el spread se come buena parte del precio la posición nace
+        # valorada al bid (que es donde se sale) y el objetivo, calculado sobre el ask
+        # de entrada, queda a un recorrido inalcanzable. Medido sobre el registro:
+        # S20 compró a 0.8756 en un libro de 0.47/0.85 (spread 0.38) y S02 entró a
+        # 0.06 en libros de 0.01/0.06; ambos nacían con el stop cruzado respecto al
+        # bid y morían en el primer ciclo. Eso mide al harness, no a la estrategia.
         token_name = signal.get("token", "Yes")
         spread_at_entry = 0.0
+        bid_now = 0.0
+        ask_now = 0.0
         try:
-            bid = to_float((self._market_field(market, "best_bid", {}) or {}).get(token_name), 0.0)
-            ask = to_float((self._market_field(market, "best_ask", {}) or {}).get(token_name), 0.0)
-            if ask > bid > 0:
-                spread_at_entry = ask - bid
+            bid_now = to_float((self._market_field(market, "best_bid", {}) or {}).get(token_name), 0.0)
+            ask_now = to_float((self._market_field(market, "best_ask", {}) or {}).get(token_name), 0.0)
+            if ask_now > bid_now > 0:
+                spread_at_entry = ask_now - bid_now
         except Exception:
             spread_at_entry = 0.0
+
+        long_entry = is_long_side(side)
+        tick = to_float(self._market_field(market, "tick_size", 0.01), 0.01) or 0.01
+        # Base ejecutable de salida: un largo se cierra vendiendo al BID; un corto,
+        # comprando al ASK (ver _exit_reference_price).
+        exit_basis = bid_now if long_entry else ask_now
+        spread_limit = max(PAPER_MAX_SPREAD_MIN_ABS, PAPER_MAX_SPREAD_PCT * exec_price)
+        if ask_now > bid_now > 0 and spread_at_entry > spread_limit:
+            signal["execution_skipped"] = (
+                f"spread_excesivo: {spread_at_entry:.4f} > {spread_limit:.4f} "
+                f"(libro {bid_now:.4f}/{ask_now:.4f})"
+            )
+            return None
+
+        # El stop y el objetivo tienen que ser alcanzables respecto a la base de
+        # salida, no sólo respecto a la entrada: un stop ya cruzado ahí cierra la
+        # posición en el primer ciclo, a un precio peor (pérdida fabricada).
+        if exit_basis > 0:
+            if long_entry:
+                if target_price <= exit_basis + tick:
+                    signal["execution_skipped"] = (
+                        f"objetivo_ya_alcanzado: objetivo {target_price:.4f} "
+                        f"<= bid {exit_basis:.4f}"
+                    )
+                    return None
+                if stop_loss > exit_basis - tick:
+                    risk_abs = abs(exec_price - stop_loss)
+                    stop_loss = round(max(0.01, exit_basis - max(tick, risk_abs)), 4)
+                    signal["stop_reanchored_to_exit_basis"] = True
+                    if stop_loss <= 0.01:
+                        signal["execution_skipped"] = (
+                            f"stop_degenerado: bid {exit_basis:.4f} no admite stop con riesgo"
+                        )
+                        return None
+            else:
+                if target_price >= exit_basis - tick:
+                    signal["execution_skipped"] = (
+                        f"objetivo_ya_alcanzado: objetivo {target_price:.4f} "
+                        f">= ask {exit_basis:.4f}"
+                    )
+                    return None
+                if stop_loss < exit_basis + tick:
+                    risk_abs = abs(stop_loss - exec_price)
+                    stop_loss = round(min(0.99, exit_basis + max(tick, risk_abs)), 4)
+                    signal["stop_reanchored_to_exit_basis"] = True
+                    if stop_loss >= 0.99:
+                        signal["execution_skipped"] = (
+                            f"stop_degenerado: ask {exit_basis:.4f} no admite stop con riesgo"
+                        )
+                        return None
+
+            if not entry_geometry_valid(exec_price, stop_loss, target_price, side):
+                signal["execution_skipped"] = (
+                    f"geometria_invalida: entrada {exec_price:.4f} stop {stop_loss:.4f} "
+                    f"objetivo {target_price:.4f} lado {side}"
+                )
+                return None
+            signal["stop_loss"] = f"{stop_loss:.4f}"
 
         new_trade = {
             "trade_id": trade_key,
@@ -682,6 +752,9 @@ class PaperTradingEngine:
             "target_price": round(target_price, 4),
             "stop_loss": round(stop_loss, 4),
             "initial_stop_loss": round(stop_loss, 4),
+            # Trazabilidad del anclaje: el stop se movió para quedar por detrás del
+            # precio al que realmente se sale (bid del largo / ask del corto).
+            "stop_reanchored_to_exit_basis": bool(signal.get("stop_reanchored_to_exit_basis")),
             # El pico arranca en el precio de EJECUCIÓN, no en el de la señal: si
             # arrancaba por encima, el break-even se activaba en el primer ciclo.
             "peak_price": round(exec_price, 4),
@@ -935,6 +1008,14 @@ class PaperTradingEngine:
             if exit_mark <= 0:
                 exit_mark = curr_float
             trade["exit_reference_price"] = round(exit_mark, 4)
+            # El PnL flotante y el pico se miden en la MISMA base que la salida (bid
+            # para un largo, ask para un corto). Medidos contra el precio medio, un
+            # libro ancho fabricaba ganancia: S20 entró a 0.8756 con bid 0.47 y el
+            # pico marcaba 0.95 (+8.5%), lo que activaba el break-even y dejaba el
+            # trailing stop en 0.931, POR ENCIMA de la entrada; el primer ciclo
+            # cerraba la posición con una pérdida que el mercado nunca dio.
+            mark = exit_mark if exit_mark > 0 else curr_float
+            trade["current_price"] = round(mark, 4)
             entry = trade["entry_price"]
             target = trade["target_price"]
             shares = trade["shares"]
@@ -947,11 +1028,11 @@ class PaperTradingEngine:
 
             # Cálculo de PnL Flotante
             if long_position:
-                pnl_usd = (curr_float - entry) * shares
-                pnl_pct = ((curr_float - entry) / entry) * 100.0
+                pnl_usd = (mark - entry) * shares
+                pnl_pct = ((mark - entry) / entry) * 100.0
 
                 # Actualizar precio pico favorable
-                peak = max(to_float(trade.get("peak_price", entry)), curr_float)
+                peak = max(to_float(trade.get("peak_price", entry)), mark)
                 trade["peak_price"] = round(peak, 4)
                 peak_gain_pct = ((peak - entry) / entry) * 100.0
 
@@ -994,10 +1075,10 @@ class PaperTradingEngine:
                     ) or changed
 
             else:  # Corto genuino (SELL / SELL_BUNDLE)
-                pnl_usd = (entry - curr_float) * shares
-                pnl_pct = ((entry - curr_float) / entry) * 100.0
+                pnl_usd = (entry - mark) * shares
+                pnl_pct = ((entry - mark) / entry) * 100.0
 
-                lowest = min(to_float(trade.get("peak_price", entry)), curr_float)
+                lowest = min(to_float(trade.get("peak_price", entry)), mark)
                 trade["peak_price"] = round(lowest, 4)
                 peak_gain_pct = ((entry - lowest) / entry) * 100.0
 

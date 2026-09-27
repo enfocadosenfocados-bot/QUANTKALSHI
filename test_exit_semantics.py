@@ -234,10 +234,15 @@ class ExitSemanticsTests(unittest.TestCase):
             "edge": 0.02,
             "urgency": "HIGH",  # urgencia alta: cruza el spread (taker) y es determinista
         }
-        market = FakeMarket(bid=0.40, ask=0.60)
+        # Libro realista: el 0.40/0.60 que usaba este test (spread 0.20 sobre un
+        # precio de 0.60) no es un mercado operable y ahora la puerta de spread lo
+        # rechaza. Lo que se comprueba sigue siendo la base del fill, no su tamaño.
+        market = FakeMarket(bid=0.58, ask=0.60)
         trade = self.engine.evaluate_and_record_signal(signal, market)
         self.assertIsNotNone(trade, "la entrada taker deberia cruzar el ask 0.60")
-        self.assertGreaterEqual(trade["entry_price"], 0.55)
+        # Igualdad con el ask (0.60) y no con el bid (0.58): un fill al bid dejaría
+        # el PnL largo regalado desde el primer tick.
+        self.assertAlmostEqual(trade["entry_price"], 0.60, places=2)
         print(
             f"[TEST Entrada] BOTH entra a {trade['entry_price']} (ask) y no a "
             f"{market.best_bid['Yes']} (bid)"

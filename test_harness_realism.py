@@ -560,5 +560,100 @@ class RecordScopeTests(HarnessStubMixin, unittest.TestCase):
         )
 
 
+class ExitBasisInvariantTests(HarnessStubMixin, unittest.TestCase):
+    """B4: el stop y el pico se miden en la base a la que se sale de verdad.
+
+    Tercera vuelta del mismo defecto, ahora en la pata de salida. Sobre el registro
+    real del harness corregido, 18 de 28 cierres duraron menos de 0.7 s y todos
+    salieron por un stop que ya estaba cruzado al abrir. Dos causas, ambas del
+    harness:
+
+      * S20 compró a 0.8756 un libro de 0.47/0.85 (spread 0.38, el 43% del precio) y
+        S02 entró a 0.06 en libros de 0.01/0.06. En mercados así el objetivo medido
+        desde el ask es inalcanzable y el stop nace por encima del bid.
+      * el pico se seguía con el precio MEDIO mientras la entrada era el ask y la
+        salida el bid: el 0.95 del mid sobre una entrada de 0.8756 era un +8.5%
+        inexistente que activaba el break-even y dejaba el trailing stop en 0.931,
+        por encima de la entrada, y el primer ciclo cerraba como "Stop Loss".
+    """
+
+    def setUp(self):
+        self._patch_engines()
+        self.engine = PaperTradingEngine(
+            storage_path=Path(tempfile.mkdtemp()) / "paper_trades.json",
+            budget_mode="per_strategy",
+        )
+        self.engine.trades.clear()
+
+    def test_wide_spread_entry_is_rejected(self):
+        """El libro real de S20 (0.47/0.85): no es un mercado operable, no se mide."""
+        signal = self._signal(
+            entry_price="0.9500",
+            target_price="0.9900",
+            stop_loss="0.9000",
+        )
+        trade = self.engine.evaluate_and_record_signal(signal, FakeMarket(bid=0.47, ask=0.85))
+
+        self.assertIsNone(trade, "un spread del 43% del precio no es un mercado operable")
+        self.assertIn("spread_excesivo", signal.get("execution_skipped", ""))
+        self.assertEqual(self.engine.trades, {})
+        print(
+            f"[TEST Base de salida] libro 0.47/0.85 con entrada 0.95 -> rechazada "
+            f"({signal['execution_skipped']})"
+        )
+
+    def test_peak_follows_the_exit_basis_not_the_mid(self):
+        """El mid sube a 0.75 y el bid se queda en 0.55: no hay ganancia que proteger."""
+        signal = self._signal()  # entrada 0.60, objetivo 0.62, stop 0.58
+        opened = self.engine.evaluate_and_record_signal(signal, FakeMarket(bid=0.55, ask=0.56))
+        self.assertIsNotNone(opened)
+        self.assertAlmostEqual(opened["entry_price"], 0.56, places=4)
+
+        # El libro se ensancha: mid 0.75 (+34% falso desde 0.56) pero el bid sigue en
+        # 0.55, que es el precio al que de verdad se saldría.
+        self.engine.update_live_prices(FakeRegistry(FakeMarket(bid=0.55, ask=0.95)))
+
+        self.assertEqual(opened["status"], "OPEN", "el mid no es un precio de salida")
+        self.assertFalse(opened["break_even_active"])
+        self.assertFalse(opened["trailing_stop_active"])
+        self.assertLess(opened["peak_price"], opened["entry_price"] * 1.04)
+        self.assertLess(opened["unrealized_pnl_usd"], 0.0)
+        print(
+            f"[TEST Base de salida] mid 0.75 / bid 0.55 sobre entrada 0.56 -> pico "
+            f"{opened['peak_price']} y sigue OPEN (antes cerraba por un break-even falso)"
+        )
+
+    def test_stop_is_reanchored_behind_the_bid(self):
+        """Un stop cruzado respecto al bid se reancla; registrarlo cruzado es una pérdida segura."""
+        signal = self._signal(
+            entry_price="0.2900",
+            target_price="0.3100",
+            stop_loss="0.2700",
+        )
+        market = FakeMarket(bid=0.27, ask=0.29)
+        trade = self.engine.evaluate_and_record_signal(signal, market)
+
+        self.assertIsNotNone(trade)
+        self.assertAlmostEqual(trade["entry_price"], 0.29, places=4)
+        self.assertTrue(trade["stop_reanchored_to_exit_basis"])
+        self.assertLess(
+            trade["stop_loss"], market.best_bid["Yes"], "el stop debe quedar por debajo del bid"
+        )
+        self.assertTrue(
+            entry_geometry_valid(
+                trade["entry_price"], trade["stop_loss"], trade["target_price"], trade["side"]
+            )
+        )
+
+        self.engine.update_live_prices(FakeRegistry(market))
+        self.assertEqual(
+            trade["status"], "OPEN", "sin el anclaje a la base de salida moría en el primer ciclo"
+        )
+        print(
+            f"[TEST Base de salida] stop 0.27 sobre bid 0.27 -> reanclado a "
+            f"{trade['stop_loss']} y sigue OPEN"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

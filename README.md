@@ -300,6 +300,33 @@ Las metricas tambien dejaron de mentir: Sharpe devuelve `None` por debajo de 10
 trades cerrados, el Kelly con win rate empirico espera a 20 trades y el bandido
 contextual premia por PnL normalizado en vez de por acierto.
 
+### Base de medida: entrada, pico y salida
+
+Una operacion no se mide si el simulador se mide a si mismo. El harness fija cuatro
+invariantes en `paper_tracker.py` y **descarta** la operacion cuando no se cumplen,
+en vez de registrarla con una metrica imposible:
+
+- **El riesgo se ancla al fill, no a la senal.** Si el libro se movio entre la senal
+  y la orden, stop y objetivo se reescalan al precio real de ejecucion; si el desvio
+  supera `PAPER_ENTRY_DRIFT_PCT` / `PAPER_ENTRY_DRIFT_MIN_ABS`, la operacion se
+  descarta porque la tesis con la que se genero ya no describe ese mercado.
+- **El stop y el objetivo tienen que ser alcanzables desde el precio al que se SALE**
+  (bid para un largo, ask para un corto). Un stop ya cruzado respecto a esa base
+  cierra la posicion en el primer ciclo a un precio peor: una perdida que el mercado
+  nunca dio y que despues mueve el circuit breaker del gobernador.
+- **El spread es una puerta.** El limite es el mayor de `PAPER_MAX_SPREAD_PCT` (5%
+  del precio de ejecucion) y `PAPER_MAX_SPREAD_MIN_ABS` (3 centavos, porque un tick
+  de Kalshi ya es 0.01). Un libro 0.47/0.85 sobre una entrada de 0.8756 (43% de
+  spread) no es operable: el objetivo medido desde el ask es inalcanzable y el stop
+  nace por encima del bid.
+- **El pico se sigue en la base de salida**, no en el precio medio. Con el mid, un
+  libro ancho marcaba un +8.5% inexistente sobre la entrada, activaba el break-even
+  y dejaba el trailing stop por encima de la entrada: cierre inmediato etiquetado
+  "Stop Loss" con PnL negativo. El PnL flotante tambien se valora ahi.
+
+Medido sobre el registro real del harness corregido: de 28 cierres, 18 duraron menos
+de 0.7 s por un stop cruzado al abrir. Eso medía al harness, no a las estrategias.
+
 ### Puerta de promocion PAPER -> LIVE
 
 `strategy_promotion.py` decide que estrategia merece capital real. Ninguna pasa
