@@ -334,9 +334,16 @@ en vez de registrarla con una metrica imposible:
 
 Medido sobre el registro real del harness corregido: de 28 cierres, 18 duraron menos
 de 0.7 s por un stop cruzado al abrir. Eso medía al harness, no a las estrategias.
-Con el anclaje a la base de salida ya activo, los 9 cierres del baseline nuevo
+Con el anclaje a la base de salida ya activo, los 9 cierres del primer baseline
 duraron entre 13.5 s y 113 s (media 62 s), con 0 por stop cruzado al abrir y 0 con
-spread fuera de puerta.
+spread fuera de puerta. La auditoria de la sesion siguiente (26 cierres en 25 minutos)
+confirma el patron con una muestra mayor: minimo 13.55 s, media 601 s, ningun cierre
+sub-segundo, ningun spread por encima de la puerta (peor caso 0.04) y 14 stops
+reanclados a la base de salida. El rojo de esa sesion (-341 USD realizados, 23
+perdedoras de 26) es de las estrategias, no del simulador: 20 de los cierres salieron
+por debajo del precio de referencia, que es el coste de profundidad de mas abajo, y el
+freno global del gobernador se armo solo a los 25 minutos (no llego a la ronda
+siguiente de promocion).
 
 ### Puerta de promocion PAPER -> LIVE
 
