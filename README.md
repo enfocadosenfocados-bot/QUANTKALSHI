@@ -61,7 +61,8 @@ cd ~/quantkalshi
 bash deploy/install_vps.sh
 ```
 
-Si el repo es privado, autentica antes (`gh auth login`) o clona con un token:
+El repositorio es **publico**, asi que ese `git clone` no pide credenciales. Si en algun
+momento vuelve a ser privado, autentica antes (`gh auth login`) o clona con un token:
 `git clone https://<TOKEN>@github.com/enfocadosenfocados-bot/QUANTKALSHI.git`.
 
 `deploy/install_vps.sh` es idempotente (repetirlo repara/reinstala) y hace:
