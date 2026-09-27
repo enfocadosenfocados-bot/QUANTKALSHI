@@ -404,6 +404,13 @@ Los contadores viven en memoria (un reinicio empieza a contar de cero) y el log 
 imprime la primera aparicion de cada motivo y cada 50 repeticiones: el bucle evalua
 miles de senales por ciclo y un print por descarte inundaria el log.
 
+Cada senal se pasa a los dos motores (`paper_tracker` y `paper_tracker_research`), asi
+que un mismo motivo aparece dos veces en el log con el mismo contador: son dos
+contadores independientes, y el que publica `GET /api/track-record` es el del motor
+realista. La primera lectura en vivo, con el freno global armado, fue
+`{"global_paused": 5732}`: el 100% de los descartes era el gobernador, no el filtro de
+conviccion ni el libro.
+
 
 | Endpoint | Descripcion |
 |----------|-------------|
