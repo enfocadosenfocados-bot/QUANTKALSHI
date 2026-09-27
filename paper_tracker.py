@@ -213,6 +213,12 @@ class PaperTradingEngine:
         self.budget_per_strategy = budget_per_strategy
         self.max_open_per_strategy = max_open_per_strategy
         self.trades: Dict[str, Dict[str, Any]] = {}
+        # Diagnóstico de admisión (en memoria, no se persiste): por qué el harness no
+        # abrió cada operación. Sin esto un descarte era indistinguible de "no hubo
+        # señal": el motivo se escribía en el dict de la señal y se perdía al salir de
+        # la función, así que no había forma de saber si el bot no opera por liquidez,
+        # por spread, por geometría, por capital o por el gobernador.
+        self.admission_stats: Dict[str, int] = {}
         self._load_from_disk()
 
     def _load_from_disk(self):
@@ -310,6 +316,36 @@ class PaperTradingEngine:
             ),
         }
 
+    def _note_admission_skip(self, key: str, detail: str = "") -> None:
+        """Contabiliza (y deja constancia una vez) por qué una señal no se abrió.
+
+        El contador es la única forma de responder "¿el bot no opera porque no hay
+        señales o porque el harness las descarta?". Se imprime sólo la primera vez
+        que aparece cada motivo y cada 50 repeticiones: el bucle evalúa miles de
+        señales por ciclo y un print por descarte inundaría el log.
+        """
+        key = (str(key) or "sin_motivo").strip()
+        self.admission_stats[key] = self.admission_stats.get(key, 0) + 1
+        seen = self.admission_stats[key]
+        if seen == 1 or seen % 50 == 0:
+            suffix = f" ({detail})" if detail else ""
+            print(f"[PaperTrading] descarte {key} x{seen}{suffix}")
+
+    def _skip_signal(
+        self,
+        signal: Dict[str, Any],
+        field: str,
+        reason: str,
+        key: Optional[str] = None,
+    ) -> None:
+        """Marca el motivo en la señal y lo contabiliza antes de descartarla."""
+        signal[field] = reason
+        if key is None:
+            # Los motivos del harness son "etiqueta: detalle"; la etiqueta es la
+            # clave estable (el detalle lleva precios y rompería el contador).
+            key = str(reason).split(":")[0]
+        self._note_admission_skip(key, str(signal.get("strategy_code") or ""))
+
     def evaluate_and_record_signal(self, signal: Dict[str, Any], market: Any) -> Optional[Dict[str, Any]]:
         """Evalúa si una señal califica como 'Top Sniper' y la registra en el track record con Kelly Sizing."""
         confidence = to_float(signal.get("confidence"), 0.0)
@@ -324,24 +360,26 @@ class PaperTradingEngine:
             from strategy_governor import governor
             sg_code = signal.get("strategy_code", "GEN")
             if governor.is_globally_paused():
-                signal["governor_skipped"] = "global_paused"
+                self._skip_signal(signal, "governor_skipped", "global_paused")
                 return None
             if governor.is_paused(sg_code):
-                signal["governor_skipped"] = "paused"
+                self._skip_signal(signal, "governor_skipped", "paused")
                 return None
             _rules = governor.get_rules(sg_code)
             if _rules.get("min_confidence") and confidence < to_float(_rules.get("min_confidence"), 0.0):
-                signal["governor_skipped"] = "below_min_confidence"
+                self._skip_signal(signal, "governor_skipped", "below_min_confidence")
                 return None
             if _rules.get("max_entry_price") and entry_price > to_float(_rules.get("max_entry_price"), 0.0):
-                signal["governor_skipped"] = "above_max_entry_price"
+                self._skip_signal(signal, "governor_skipped", "above_max_entry_price")
                 return None
         except ImportError:
             pass
 
         if entry_price <= 0.01 or entry_price >= 0.99:
+            self._note_admission_skip("precio_inoperable", f"{entry_price:.4f}")
             return None
         if entry_price < MIN_SIGNAL_ENTRY_PRICE:
+            self._note_admission_skip("precio_bajo_minimo", f"{entry_price:.4f}")
             return None
 
         # Si no tiene target o stop loss, fijarlo cuantitativamente
@@ -525,11 +563,30 @@ class PaperTradingEngine:
         signal["is_top_sniper"] = is_sniper
 
         if not is_sniper:
+            # El motivo importa: "no hay señales" y "el harness las descarta por
+            # confianza/horizonte/liquidez" exigen decisiones opuestas.
+            min_conf = 60.0 if self.budget_mode == "per_strategy" else PAPER_MIN_CONFIDENCE
+            causes = []
+            if confidence < min_conf:
+                causes.append("confianza")
+            if not horizon_allowed:
+                causes.append("horizonte")
+            if not has_liquidity:
+                causes.append("liquidez")
+            if not (0.02 < entry_price < 0.98):
+                causes.append("precio")
+            self._note_admission_skip(
+                "no_sniper:" + ",".join(causes or ["desconocido"]),
+                str(signal.get("strategy_code") or ""),
+            )
             return None
 
         trade_key = signal.get("dedupe_key") or f"{signal.get('strategy_code')}:{getattr(market, 'market_id', '')}:{signal.get('token')}:{side}"
 
         if trade_key in self.trades:
+            # No es un rechazo (la posición ya existe), pero sin contarlo el motivo de
+            # que no se abra una operación nueva queda invisible.
+            self._note_admission_skip("duplicada", str(signal.get("strategy_code") or ""))
             return self.trades[trade_key]
 
         # ===== Bloque 1: límite de capital + ejecución con slippage/fees =====
@@ -549,11 +606,11 @@ class PaperTradingEngine:
                 max_exposure = PAPER_MAX_EXPOSURE_USD
             total_open_exposure = sum(to_float(t.get("position_size_usd"), 0.0) for t in relevant)
             if len(relevant) >= max_open:
-                signal["capital_skipped"] = "max_positions"
+                self._skip_signal(signal, "capital_skipped", "max_positions")
                 return None
             available = max_exposure - total_open_exposure
             if available < 10.0:
-                signal["capital_skipped"] = "no_capital"
+                self._skip_signal(signal, "capital_skipped", "no_capital")
                 return None
             if trade_size_usd > available:
                 trade_size_usd = round(available, 2)
@@ -580,7 +637,7 @@ class PaperTradingEngine:
             is_maker=is_maker,
         )
         if not fill.filled:
-            signal["execution_skipped"] = fill.reason
+            self._skip_signal(signal, "execution_skipped", fill.reason, key="fill_rechazado")
             return None
 
         exec_price = fill.avg_price
@@ -608,9 +665,11 @@ class PaperTradingEngine:
         drift = abs(exec_price - entry_price)
         drift_limit = max(PAPER_ENTRY_DRIFT_MIN_ABS, PAPER_ENTRY_DRIFT_PCT * entry_price)
         if drift > drift_limit:
-            signal["execution_skipped"] = (
+            self._skip_signal(
+                signal,
+                "execution_skipped",
                 f"desvio_entrada: senal {entry_price:.4f} vs ejecucion {exec_price:.4f} "
-                f"(>{drift_limit:.4f})"
+                f"(>{drift_limit:.4f})",
             )
             return None
 
@@ -641,9 +700,11 @@ class PaperTradingEngine:
         # sea alcanzable respecto a la entrada real (largo con stop debajo y objetivo
         # encima; corto al revés). Una geometría imposible garantiza una pérdida.
         if not entry_geometry_valid(exec_price, stop_loss, target_price, side):
-            signal["execution_skipped"] = (
+            self._skip_signal(
+                signal,
+                "execution_skipped",
                 f"geometria_invalida: entrada {exec_price:.4f} stop {stop_loss:.4f} "
-                f"objetivo {target_price:.4f} lado {side}"
+                f"objetivo {target_price:.4f} lado {side}",
             )
             return None
 
@@ -674,9 +735,11 @@ class PaperTradingEngine:
         exit_basis = bid_now if long_entry else ask_now
         spread_limit = max(PAPER_MAX_SPREAD_MIN_ABS, PAPER_MAX_SPREAD_PCT * exec_price)
         if ask_now > bid_now > 0 and spread_at_entry > spread_limit:
-            signal["execution_skipped"] = (
+            self._skip_signal(
+                signal,
+                "execution_skipped",
                 f"spread_excesivo: {spread_at_entry:.4f} > {spread_limit:.4f} "
-                f"(libro {bid_now:.4f}/{ask_now:.4f})"
+                f"(libro {bid_now:.4f}/{ask_now:.4f})",
             )
             return None
 
@@ -686,9 +749,11 @@ class PaperTradingEngine:
         if exit_basis > 0:
             if long_entry:
                 if target_price <= exit_basis + tick:
-                    signal["execution_skipped"] = (
+                    self._skip_signal(
+                        signal,
+                        "execution_skipped",
                         f"objetivo_ya_alcanzado: objetivo {target_price:.4f} "
-                        f"<= bid {exit_basis:.4f}"
+                        f"<= bid {exit_basis:.4f}",
                     )
                     return None
                 if stop_loss > exit_basis - tick:
@@ -696,15 +761,19 @@ class PaperTradingEngine:
                     stop_loss = round(max(0.01, exit_basis - max(tick, risk_abs)), 4)
                     signal["stop_reanchored_to_exit_basis"] = True
                     if stop_loss <= 0.01:
-                        signal["execution_skipped"] = (
-                            f"stop_degenerado: bid {exit_basis:.4f} no admite stop con riesgo"
+                        self._skip_signal(
+                            signal,
+                            "execution_skipped",
+                            f"stop_degenerado: bid {exit_basis:.4f} no admite stop con riesgo",
                         )
                         return None
             else:
                 if target_price >= exit_basis - tick:
-                    signal["execution_skipped"] = (
+                    self._skip_signal(
+                        signal,
+                        "execution_skipped",
                         f"objetivo_ya_alcanzado: objetivo {target_price:.4f} "
-                        f">= ask {exit_basis:.4f}"
+                        f">= ask {exit_basis:.4f}",
                     )
                     return None
                 if stop_loss < exit_basis + tick:
@@ -712,15 +781,19 @@ class PaperTradingEngine:
                     stop_loss = round(min(0.99, exit_basis + max(tick, risk_abs)), 4)
                     signal["stop_reanchored_to_exit_basis"] = True
                     if stop_loss >= 0.99:
-                        signal["execution_skipped"] = (
-                            f"stop_degenerado: ask {exit_basis:.4f} no admite stop con riesgo"
+                        self._skip_signal(
+                            signal,
+                            "execution_skipped",
+                            f"stop_degenerado: ask {exit_basis:.4f} no admite stop con riesgo",
                         )
                         return None
 
             if not entry_geometry_valid(exec_price, stop_loss, target_price, side):
-                signal["execution_skipped"] = (
+                self._skip_signal(
+                    signal,
+                    "execution_skipped",
                     f"geometria_invalida: entrada {exec_price:.4f} stop {stop_loss:.4f} "
-                    f"objetivo {target_price:.4f} lado {side}"
+                    f"objetivo {target_price:.4f} lado {side}",
                 )
                 return None
             signal["stop_loss"] = f"{stop_loss:.4f}"
@@ -1308,6 +1381,12 @@ class PaperTradingEngine:
             # Qué se excluye y por qué: la exclusión tiene que ser auditable, no un
             # borrado silencioso que haga parecer limpio lo que no lo era.
             "scope": self.legacy_stats(),
+            # Diagnóstico de admisión: por qué no se abrió cada señal descartada.
+            # Se ordena de mayor a menor para que la causa dominante se lea primero.
+            "admission": dict(
+                sorted(self.admission_stats.items(), key=lambda kv: (-kv[1], kv[0]))
+            ),
+            "admission_total": sum(self.admission_stats.values()),
             "updated_at": utc_now().isoformat(),
         }
 

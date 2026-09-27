@@ -655,5 +655,86 @@ class ExitBasisInvariantTests(HarnessStubMixin, unittest.TestCase):
         )
 
 
+class AdmissionDiagnosticsTests(HarnessStubMixin, unittest.TestCase):
+    """B5: un descarte tiene que dejar rastro contable, no desaparecer.
+
+    El harness decide (spread, desvío, geometría, capital, gobernador) y escribía el
+    motivo en el dict de la señal, que se descarta acto seguido: `execution_skipped`
+    y `capital_skipped` no se leían en ningún punto del bot, ni en los logs ni en el
+    dashboard. Sobre 23 logs reales no había una sola línea de descarte, así que
+    "el bot no opera" era indistinguible de "el bot descarta todo lo que ve" — y esa
+    diferencia decide si hay que tocar las estrategias o el harness.
+    """
+
+    def setUp(self):
+        self._patch_engines()
+        self.engine = PaperTradingEngine(
+            storage_path=Path(tempfile.mkdtemp()) / "paper_trades.json",
+            budget_mode="per_strategy",
+        )
+        self.engine.trades.clear()
+
+    def test_spread_rejection_is_counted(self):
+        signal = self._signal(
+            entry_price="0.9500",
+            target_price="0.9900",
+            stop_loss="0.9000",
+        )
+        trade = self.engine.evaluate_and_record_signal(signal, FakeMarket(bid=0.47, ask=0.85))
+
+        self.assertIsNone(trade)
+        self.assertIn("spread_excesivo", signal["execution_skipped"])
+        self.assertEqual(self.engine.admission_stats.get("spread_excesivo"), 1)
+        print(f"[TEST Admisión] spread 0.38 descartado y contado: {self.engine.admission_stats}")
+
+    def test_capital_rejection_is_counted(self):
+        """Dos posiciones abiertas con cupo de 2: la tercera no cabe y lo dice."""
+        self.engine.max_open_per_strategy = 2
+        for i in (1, 2):
+            opened = self.engine.evaluate_and_record_signal(
+                self._signal(dedupe_key=f"MM:M{i}:Yes:BOTH"),
+                FakeMarket(bid=0.55, ask=0.56, market_id=f"M{i}"),
+            )
+            self.assertIsNotNone(opened)
+            self.assertEqual(opened["status"], "OPEN")
+
+        blocked = self._signal(dedupe_key="MM:M3:Yes:BOTH")
+        trade = self.engine.evaluate_and_record_signal(
+            blocked, FakeMarket(bid=0.55, ask=0.56, market_id="M3")
+        )
+
+        self.assertIsNone(trade)
+        self.assertEqual(blocked["capital_skipped"], "max_positions")
+        # La clave del contador es la etiqueta estable del motivo ("max_positions"),
+        # no el campo que lo transporta: `no_capital` se cuenta por separado.
+        self.assertEqual(self.engine.admission_stats.get("max_positions"), 1)
+        self.assertIsNone(self.engine.admission_stats.get("no_capital"))
+        print(f"[TEST Admisión] cupo agotado y contado: {self.engine.admission_stats}")
+
+    def test_no_sniper_is_counted_with_its_cause(self):
+        """Confianza 50 < 60: el descarte dice que fue por confianza, no por liquidez."""
+        signal = self._signal(confidence=50.0)
+        trade = self.engine.evaluate_and_record_signal(signal, FakeMarket(bid=0.55, ask=0.56))
+
+        self.assertIsNone(trade)
+        self.assertIs(False, signal.get("is_top_sniper"))
+        self.assertEqual(self.engine.admission_stats.get("no_sniper:confianza"), 1)
+
+        summary = self.engine.get_summary()
+        self.assertEqual(summary["admission_total"], 1)
+        self.assertEqual(summary["admission"]["no_sniper:confianza"], 1)
+        print(f"[TEST Admisión] publicado en /api/track-record: {summary['admission']}")
+
+    def test_duplicate_signal_is_counted_without_reopening(self):
+        market = FakeMarket(bid=0.55, ask=0.56)
+        first = self.engine.evaluate_and_record_signal(self._signal(), market)
+        again = self.engine.evaluate_and_record_signal(self._signal(), market)
+
+        self.assertIsNotNone(first)
+        self.assertIs(again, first, "un duplicado devuelve la posición viva, no una nueva")
+        self.assertEqual(self.engine.admission_stats.get("duplicada"), 1)
+        print("[TEST Admisión] duplicado contado sin abrir una segunda posición")
+
+
 if __name__ == "__main__":
     unittest.main()

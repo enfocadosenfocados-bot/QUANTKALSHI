@@ -297,6 +297,13 @@ Kalshi cobra y lo que el libro permite:
 - **RFM inyectable**: los tests fijan la semilla, asi que los resultados son
   reproducibles.
 
+Los dos costes de salida se pueden medir en el propio registro: en los 9 cierres del
+baseline nuevo, 8 completaron por debajo del libro visible (`exit_reference_price` vs
+`exit_price`, entre 0.04 y 0.97 ticks adversos, media 0.63) y la comision de salida
+sumo el 4.5% del nocional cerrado. Lo paga tambien una operacion ganadora, asi que la
+vara es la misma para todos; conviene saberlo antes de leer un win rate, porque medio
+tick de profundidad mas la comision se comen buena parte del edge declarado.
+
 Las metricas tambien dejaron de mentir: Sharpe devuelve `None` por debajo de 10
 trades cerrados, el Kelly con win rate empirico espera a 20 trades y el bandido
 contextual premia por PnL normalizado en vez de por acierto.
@@ -327,6 +334,9 @@ en vez de registrarla con una metrica imposible:
 
 Medido sobre el registro real del harness corregido: de 28 cierres, 18 duraron menos
 de 0.7 s por un stop cruzado al abrir. Eso medía al harness, no a las estrategias.
+Con el anclaje a la base de salida ya activo, los 9 cierres del baseline nuevo
+duraron entre 13.5 s y 113 s (media 62 s), con 0 por stop cruzado al abrir y 0 con
+spread fuera de puerta.
 
 ### Puerta de promocion PAPER -> LIVE
 
@@ -365,7 +375,35 @@ instante dejaba un JSON roto y el track record se perdia entero al arrancar. Un
 archivo ilegible ahora avisa explicitamente en el log en vez de desaparecer en
 silencio.
 
-## Endpoints principales
+### Diagnostico de admision
+
+Un descarte es indistinguible de "no hubo senal" mientras nadie lo cuente. El harness
+escribia el motivo en la senal (spread, desvio, geometria, capital, gobernador) y la
+descartaba acto seguido, asi que `execution_skipped` y `capital_skipped` no se leian
+en ningun punto del bot: ni en los logs ni en el dashboard. En 23 logs reales no habia
+una sola linea de descarte, y sin ese dato no se puede decidir si el bot no opera
+porque no ve oportunidades o porque las rechaza todas.
+
+`PaperTradingEngine` los cuenta en `admission_stats` y los publica en
+`GET /api/track-record` (`admission` y `admission_total`), de mayor a menor:
+
+| Clave | Significado |
+|-------|-------------|
+| `no_sniper:<causa>` | No pasa el filtro de conviccion: `confianza`, `horizonte`, `liquidez` o `precio` |
+| `spread_excesivo` | Libro no operable (mas de `PAPER_MAX_SPREAD_PCT` / `MIN_ABS`) |
+| `desvio_entrada` | El fill se alejo mas de `PAPER_ENTRY_DRIFT_PCT` / `MIN_ABS` de la senal |
+| `geometria_invalida` | Stop y objetivo no son alcanzables desde la entrada real |
+| `objetivo_ya_alcanzado` | El objetivo ya estaba cruzado respecto a la base de salida |
+| `stop_degenerado` | El bid (largo) o el ask (corto) no admite un stop con riesgo |
+| `fill_rechazado` | El libro no permitio ejecutar: minimo de tamano o sin liquidez en el limite |
+| `max_positions` / `no_capital` | Cupo de posiciones o presupuesto agotado |
+| `global_paused` / `paused` / `below_min_confidence` / `above_max_entry_price` | Descarte del gobernador |
+| `duplicada` | La posicion ya existe: no se abre otra |
+
+Los contadores viven en memoria (un reinicio empieza a contar de cero) y el log solo
+imprime la primera aparicion de cada motivo y cada 50 repeticiones: el bucle evalua
+miles de senales por ciclo y un print por descarte inundaria el log.
+
 
 | Endpoint | Descripcion |
 |----------|-------------|
